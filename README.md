@@ -70,3 +70,54 @@ OK result whose diagnostic error is too high, opt in explicitly:
 --contact-tolerance 1e-3 `
 --rotation-samples 24
 ```
+
+## 从模型预测选择约束并求解
+
+`predictions_test.json` 中 `predictions` 往往比 GT 多。可以用 `prediction_run.py`
+先从预测约束池里选出一个小而自洽的子集，再走和 GT 批处理相同的
+`load_assembly_payload -> collect_pair_jobs -> solve_jobs -> save_solution_step`
+流程：
+
+```bash
+conda run -n catia_assembly python -m reconstructed_solver.prediction_run \
+  --predictions-json /home/xiazhen/cad/AssemblyTry/pipline_model/reconstructed_solver/predictions_test.json \
+  --json-root /home/xiazhen/cad/Assembly/data/new_sw_final_assemblies/max_faces_50/pair \
+  --step-root /home/xiazhen/cad/Assembly/data/new_sw_final_assemblies/max_faces_50/pair/step \
+  --output-dir /home/xiazhen/cad/AssemblyTry/pipline_model/reconstructed_solver/prediction_output \
+  --workers 4
+```
+
+约束选择策略分两层：
+
+- 先做轻量筛选：只保留当前求解器支持的 `Coincident`、`Concentric`、
+  `Parallel`、`Perpendicular`，按 `(part_a, face_a, part_b, face_b, type)`
+  去重，丢掉低于 `--score-threshold` 的预测，再最多保留
+  `--max-predictions` 个候选。
+- 再用求解器验证：在候选池中构造若干 1 到 `--max-constraints` 个约束的
+  子集，优先尝试高分且包含定位关系的组合，然后逐个调用现有 `solve_jobs`。
+  第一个满足求解状态和选择策略的子集会被选中；如果没有完全 OK 的子集，
+  会保留最佳失败/碰撞诊断，便于调阈值。
+
+常用调参：
+
+```bash
+conda run -n catia_assembly python -m reconstructed_solver.prediction_run \
+  --limit 100 \
+  --score-threshold 0.5 \
+  --max-predictions 16 \
+  --beam-size 24 \
+  --max-constraints 3
+```
+
+默认情况下，如果候选池里存在 `Coincident` 或 `Concentric`，脚本不会把纯
+`Parallel/Perpendicular` 子集当成最终成功结果，因为这类约束可能只确定方向、
+不确定装配位置。确实需要接受方向约束单独求解时，可以显式添加：
+
+```bash
+--allow-direction-only
+```
+
+每个样本会输出一个结果 JSON，其中 `prediction_selection.pool` 记录进入候选池
+的预测，`prediction_selection.attempts` 记录每个候选子集的求解状态，
+`prediction_selection.selected_predictions` 是最终选中的预测约束。总汇总写入
+`prediction_results.json`，成功或可导出的 STEP 与 GT 批处理输出格式保持一致。

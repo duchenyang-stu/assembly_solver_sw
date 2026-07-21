@@ -468,6 +468,23 @@ def normalize_constraint_kind(constraint: dict) -> str:
     return raw_kind
 
 
+def constraint_orientation(params: dict) -> int:
+    raw_orientation = params.get("orientation")
+    if raw_orientation not in {None, ""}:
+        return int(raw_orientation or 0)
+
+    raw_alignment = params.get("alignment")
+    if raw_alignment in {None, ""}:
+        return 0
+
+    alignment = int(raw_alignment)
+    if alignment == 0:
+        return 1
+    if alignment == 1:
+        return 2
+    return alignment
+
+
 def extract_constraints(data: dict, face_index_base: int = 0) -> List[PairConstraint]:
     raw_constraints = data.get("internal_constraints") or data.get("constraints") or []
     constraints: List[PairConstraint] = []
@@ -494,7 +511,7 @@ def extract_constraints(data: dict, face_index_base: int = 0) -> List[PairConstr
                 kind=normalize_constraint_kind(item),
                 source_kind=str(item.get("source_constraint_type") or item.get("constraint_type") or ""),
                 value=float(params.get("raw_value", 0.0) or 0.0),
-                orientation=int(params.get("orientation", 0) or 0),
+                orientation=constraint_orientation(params),
                 refs=(refs[0], refs[1]),
             )
         )
