@@ -299,6 +299,7 @@ def _candidate_constraint_sets(job: PairJob) -> list[tuple[str, list[core.PairCo
     candidates: list[tuple[str, list[core.PairConstraint], list[str]]] = [
         ("primary", list(job.constraints), [])
     ]
+
     flipped: list[core.PairConstraint] = []
     flipped_names: list[str] = []
     for constraint in job.constraints:
@@ -310,6 +311,18 @@ def _candidate_constraint_sets(job: PairJob) -> list[tuple[str, list[core.PairCo
             flipped.append(constraint)
     if flipped_names:
         candidates.append(("flipped_coincident_orientation", flipped, flipped_names))
+
+    flipped_tangent: list[core.PairConstraint] = []
+    flipped_tangent_names: list[str] = []
+    for constraint in job.constraints:
+        if constraint.kind == "tangent" and int(constraint.orientation) in {1, 2}:
+            flipped_orientation = 1 if int(constraint.orientation) == 2 else 2
+            flipped_tangent.append(replace(constraint, orientation=flipped_orientation))
+            flipped_tangent_names.append(constraint.name)
+        else:
+            flipped_tangent.append(constraint)
+    if flipped_tangent_names:
+        candidates.append(("flipped_tangent_orientation", flipped_tangent, flipped_tangent_names))
     return candidates
 
 

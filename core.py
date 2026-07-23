@@ -659,13 +659,28 @@ class PairAssemblySolver:
         normal_tip_entity = system.add_point_3d(*normal_tip.tolist())
         normal_line = system.add_line_3d(point_entity, normal_tip_entity)
 
+        quaternion = self.make_quaternion(
+            float(feature.u_dir[0]),
+            float(feature.u_dir[1]),
+            float(feature.u_dir[2]),
+            float(feature.v_dir[0]),
+            float(feature.v_dir[1]),
+            float(feature.v_dir[2]),
+        )
+        normal_entity = system.add_normal_3d(*quaternion)
+        workplane = system.add_work_plane(point_entity, normal_entity)
+
+        system.distance(u_entity, workplane, 0.0, self.Entity.FREE_IN_3D)
+        system.distance(v_entity, workplane, 0.0, self.Entity.FREE_IN_3D)
+        system.distance(normal_tip_entity, workplane, PLANE_VECTOR_SIZE, self.Entity.FREE_IN_3D)
+
         return PlaneEntities(
             point=point_entity,
             u_point=u_entity,
             v_point=v_entity,
             normal_tip=normal_tip_entity,
             normal_line=normal_line,
-            workplane=None,
+            workplane=workplane,
             initial_points=np.asarray([point, u_point, v_point, normal_tip], dtype=float),
             support_entities=(point_entity, u_entity, v_entity, normal_tip_entity),
         )
@@ -1287,6 +1302,42 @@ class PairAssemblySolver:
         system.coincident(moving.axis_point, fixed.axis_line, self.Entity.FREE_IN_3D)
         system.coincident(moving.axis_end, fixed.axis_line, self.Entity.FREE_IN_3D)
 
+    def _apply_plane_cylinder_tangent(
+        self,
+        system,
+        plane: PlaneEntities,
+        cylinder: CylinderEntities,
+        cylinder_feature: CylinderFeature,
+        orientation: int,
+    ) -> None:
+        if plane.workplane is None:
+            raise ValueError("Plane bundle does not have a workplane.")
+        radius = abs(float(cylinder_feature.radius))
+        signed_radius = -radius if int(orientation) == 2 else radius
+        system.distance(cylinder.axis_point, plane.workplane, signed_radius, self.Entity.FREE_IN_3D)
+        system.distance(cylinder.axis_end, plane.workplane, signed_radius, self.Entity.FREE_IN_3D)
+
+    def _apply_cylinder_cylinder_tangent(
+        self,
+        system,
+        moving: CylinderEntities,
+        fixed: CylinderEntities,
+        moving_feature: CylinderFeature,
+        fixed_feature: CylinderFeature,
+    ) -> None:
+        distance = abs(float(moving_feature.radius)) + abs(float(fixed_feature.radius))
+        system.add_constraint(
+            self.Constraint.ANGLE,
+            self.Entity.FREE_IN_3D,
+            0.0,
+            self.Entity.NONE,
+            self.Entity.NONE,
+            moving.axis_line,
+            fixed.axis_line,
+        )
+        system.distance(moving.axis_point, fixed.axis_line, distance, self.Entity.FREE_IN_3D)
+        system.distance(moving.axis_end, fixed.axis_line, distance, self.Entity.FREE_IN_3D)
+
     def _apply_constraint(
         self,
         system,
@@ -1301,6 +1352,9 @@ class PairAssemblySolver:
         fixed_bundle = fixed_bundles[fixed_ref.face_index]
 
         if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, PlaneFeature):
+            if constraint.kind == "tangent":
+                self._apply_plane_plane_coincident(system, moving_bundle, fixed_bundle, constraint.orientation)
+                return
             if constraint.kind == "coincident":
                 self._apply_plane_plane_coincident(
                     system,
@@ -1330,6 +1384,37 @@ class PairAssemblySolver:
         if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, CylinderFeature):
             if constraint.kind in {"coincident", "concentric"}:
                 self._apply_cylinder_cylinder_concentric(system, moving_bundle, fixed_bundle)
+                return
+            if constraint.kind == "tangent":
+                self._apply_cylinder_cylinder_tangent(
+                    system,
+                    moving_bundle,
+                    fixed_bundle,
+                    moving_feature,
+                    fixed_feature,
+                )
+                return
+
+        if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, PlaneFeature):
+            if constraint.kind == "tangent":
+                self._apply_plane_cylinder_tangent(
+                    system,
+                    fixed_bundle,
+                    moving_bundle,
+                    moving_feature,
+                    constraint.orientation,
+                )
+                return
+
+        if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, CylinderFeature):
+            if constraint.kind == "tangent":
+                self._apply_plane_cylinder_tangent(
+                    system,
+                    moving_bundle,
+                    fixed_bundle,
+                    fixed_feature,
+                    constraint.orientation,
+                )
                 return
 
         raise NotImplementedError(
