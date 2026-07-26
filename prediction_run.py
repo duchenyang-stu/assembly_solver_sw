@@ -140,7 +140,13 @@ def parse_args() -> argparse.Namespace:
         "--beam-size",
         type=int,
         default=24,
-        help="Maximum number of constraint subsets evaluated per sample.",
+        help="Maximum number of pruned incremental constraint combinations evaluated per sample.",
+    )
+    parser.add_argument(
+        "--max-saved-candidates",
+        type=int,
+        default=5,
+        help="Maximum number of solver-ok prediction combinations exported per sample.",
     )
     parser.add_argument(
         "--min-constraints",
@@ -215,6 +221,7 @@ def main() -> None:
         "score_threshold": float(args.score_threshold),
         "max_predictions": int(args.max_predictions),
         "beam_size": int(args.beam_size),
+        "max_saved_candidates": int(args.max_saved_candidates),
         "min_constraints": int(args.min_constraints),
         "max_constraints": int(args.max_constraints),
         "prefer_mixed_types": bool(args.prefer_mixed_types),
@@ -267,6 +274,7 @@ def main() -> None:
             "score_threshold": float(args.score_threshold),
             "max_predictions": int(args.max_predictions),
             "beam_size": int(args.beam_size),
+            "max_saved_candidates": int(args.max_saved_candidates),
             "min_constraints": int(args.min_constraints),
             "max_constraints": int(args.max_constraints),
             "prefer_mixed_types": bool(args.prefer_mixed_types),
@@ -353,6 +361,7 @@ def _run_prediction_task(task: dict[str, Any]) -> dict[str, Any]:
             score_threshold=float(context["score_threshold"]),
             max_predictions=int(context["max_predictions"]),
             beam_size=int(context["beam_size"]),
+            max_saved_candidates=int(context["max_saved_candidates"]),
             min_constraints=int(context["min_constraints"]),
             max_constraints=int(context["max_constraints"]),
             prefer_mixed_types=bool(context["prefer_mixed_types"]),
@@ -403,6 +412,7 @@ def _process_prediction_sample(
     score_threshold: float,
     max_predictions: int,
     beam_size: int,
+    max_saved_candidates: int,
     min_constraints: int,
     max_constraints: int,
     prefer_mixed_types: bool,
@@ -413,6 +423,7 @@ def _process_prediction_sample(
     sample_output_dir.mkdir(parents=True, exist_ok=True)
     raw_payload = _read_json(sample_json)
     base_payload = _convert_constraint_payload(raw_payload, sample_json, step_root, step_index=None)
+    gt_payload = _gt_summary(raw_payload)
     predictions = _prediction_constraints(prediction_item.get("predictions") or [])
     selected_pool, rejected_predictions = _filter_prediction_pool(
         predictions,
@@ -433,6 +444,7 @@ def _process_prediction_sample(
             "output_dir": str(sample_output_dir),
             "status": "dry_run_ok",
             "part_count": len(base_payload.get("parts") or []),
+            "GT": gt_payload,
             "candidate_pool_count": len(selected_pool),
             "candidate_set_count": len(candidate_sets),
             "prediction_selection": {
@@ -450,6 +462,7 @@ def _process_prediction_sample(
             "output_dir": str(sample_output_dir),
             "status": "error",
             "part_count": len(base_payload.get("parts") or []),
+            "GT": gt_payload,
             "pair_count": 0,
             "step_count": 0,
             "prediction_selection": {
@@ -462,6 +475,7 @@ def _process_prediction_sample(
         return result
 
     attempts: list[dict[str, Any]] = []
+    ok_candidate_results: list[dict[str, Any]] = []
     best_attempt: dict[str, Any] | None = None
     best_records = None
     best_jobs = None
@@ -510,12 +524,20 @@ def _process_prediction_sample(
             best_policy_jobs = attempt.get("jobs")
             best_policy_assembly = attempt.get("assembly")
 
-        if _candidate_status_is_final(attempt["summary"].get("status")) and policy_ok:
-            best_attempt = attempt["summary"]
-            best_records = attempt.get("records")
-            best_jobs = attempt.get("jobs")
-            best_assembly = attempt.get("assembly")
-            break
+        if _candidate_status_is_ok(attempt["summary"].get("status")) and policy_ok:
+            ok_candidate_results.append(attempt)
+            if len(ok_candidate_results) >= max(1, int(max_saved_candidates)):
+                best_attempt = best_policy_attempt or attempt["summary"]
+                best_records = best_policy_records or attempt.get("records")
+                best_jobs = best_policy_jobs or attempt.get("jobs")
+                best_assembly = best_policy_assembly or attempt.get("assembly")
+                break
+
+        if _candidate_status_is_final(attempt["summary"].get("status")) and policy_ok and best_policy_attempt is not None:
+            best_attempt = best_policy_attempt
+            best_records = best_policy_records
+            best_jobs = best_policy_jobs
+            best_assembly = best_policy_assembly
 
     if best_attempt is None:
         raise RuntimeError("Prediction candidate search did not produce any attempts.")
@@ -538,29 +560,32 @@ def _process_prediction_sample(
         if int(item.get("prediction_index") or 0) in predictions_by_index
     ]
     results = []
-    if best_records and best_jobs and best_assembly:
+    saved_prediction_candidates: list[dict[str, Any]] = []
+    exported_best_step: str | None = None
+    for saved_rank, ok_attempt in enumerate(ok_candidate_results[: max(1, int(max_saved_candidates))], start=1):
+        saved = _export_prediction_candidate(
+            ok_attempt,
+            selected_pool,
+            sample_output_dir,
+            export_name=f"candidate_{saved_rank:03d}",
+        )
+        if saved:
+            saved_prediction_candidates.append(saved)
+            exported_best_step = exported_best_step or saved.get("step")
+
+    if best_records and best_jobs and best_assembly and exported_best_step and best_attempt.get("status") == "ok":
         jobs_by_index = {job.index: job for job in best_jobs}
         for record in best_records:
             matrix, matrix_source = _record_matrix(record)
-            should_export = matrix is not None and (record.status == "ok" or export_rejected)
-            artifacts = (
-                save_solution_step(
-                    best_assembly,
-                    record,
-                    sample_output_dir,
-                    transform=matrix,
-                    use_pair_subdir=False,
-                )
-                if should_export
-                else {}
-            )
+            if matrix is None or record.status != "ok":
+                continue
             item = _record_json(
                 record,
                 jobs_by_index[record.index],
                 best_assembly,
                 matrix=matrix,
                 matrix_source=matrix_source,
-                step_path=artifacts.get("step"),
+                step_path=exported_best_step,
             )
             results.append(item)
 
@@ -573,13 +598,16 @@ def _process_prediction_sample(
         "output_dir": str(sample_output_dir),
         "status": status,
         "part_count": len(base_payload.get("parts") or []),
+        "GT": gt_payload,
         "pair_count": len(results),
         "step_count": sum(1 for item in results if item.get("step")),
         "prediction_selection": {
             "strategy": "beam_search_with_solver_validation",
+            "search_order": "rule_pruned_incremental_addition",
             "score_threshold": score_threshold,
             "max_predictions": max_predictions,
             "beam_size": beam_size,
+            "max_saved_candidates": max_saved_candidates,
             "min_constraints": min_constraints,
             "max_constraints": max_constraints,
             "allow_direction_only": allow_direction_only,
@@ -591,6 +619,7 @@ def _process_prediction_sample(
             "rejected": rejected_predictions,
             "selected_attempt": best_attempt,
             "selected_predictions": [_prediction_json(item) for item in selected_predictions],
+            "saved_ok_candidates": saved_prediction_candidates,
             "attempts": attempts,
         },
         "results": results,
@@ -603,6 +632,15 @@ def _process_prediction_sample(
         )
     sample_summary.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def _gt_summary(raw_payload: dict[str, Any]) -> dict[str, Any]:
+    constraints = raw_payload.get("internal_constraints")
+    if not isinstance(constraints, list):
+        constraints = []
+    return {
+        "constraints": constraints,
+    }
 
 
 def _solve_prediction_candidate(
@@ -824,47 +862,91 @@ def _candidate_prediction_sets(
         return []
     min_size = max(1, int(min_constraints))
     max_size = min(max(min_size, int(max_constraints)), len(pool))
-    target_sets: list[tuple[float, tuple[int, ...]]] = []
+    target_sets: list[tuple[float, int, tuple[int, ...]]] = []
     seen: set[tuple[int, ...]] = set()
 
-    def add(indices: Sequence[int], bonus: float = 0.0) -> None:
+    def add(indices: Sequence[int], depth: int, bonus: float = 0.0) -> bool:
         key = tuple(sorted(set(int(index) for index in indices)))
         if len(key) < min_size or len(key) > max_size or key in seen:
-            return
-        seen.add(key)
+            return False
         constraints = [pool[index] for index in key]
-        target_sets.append((_subset_rank(constraints, prefer_mixed_types=prefer_mixed_types) + bonus, key))
+        if _constraint_combo_rejection_reason(constraints) is not None:
+            return False
+        seen.add(key)
+        target_sets.append((_subset_rank(constraints, prefer_mixed_types=prefer_mixed_types) + bonus, depth, key))
+        return True
 
-    for size in range(max_size, min_size - 1, -1):
-        add(range(size), bonus=0.0)
-
+    frontier: list[tuple[int, ...]] = []
     for index in range(len(pool)):
-        for size in range(min_size, max_size + 1):
-            add(range(index, min(index + size, len(pool))), bonus=0.1)
+        key = (index,)
+        if _constraint_combo_rejection_reason([pool[index]]) is None:
+            frontier.append(key)
+            add(key, depth=1, bonus=0.0)
 
-    for first in range(len(pool)):
-        for second in range(first + 1, len(pool)):
-            add((first, second), bonus=0.2)
-            if max_size >= 3:
-                for third in range(second + 1, len(pool)):
-                    add((first, second, third), bonus=0.25)
+    depth = 1
+    while frontier and depth < max_size and len(target_sets) < max(1, int(beam_size)) * 6:
+        next_frontier: list[tuple[int, ...]] = []
+        for key in frontier:
+            last_index = key[-1]
+            for add_index in range(last_index + 1, len(pool)):
+                expanded = tuple(sorted((*key, add_index)))
+                if expanded in seen:
+                    continue
+                constraints = [pool[index] for index in expanded]
+                reason = _constraint_combo_rejection_reason(constraints)
+                if reason is not None:
+                    continue
+                next_frontier.append(expanded)
+                add(expanded, depth=depth + 1, bonus=0.02 * depth)
+        next_frontier.sort(
+            key=lambda indices: (
+                _subset_rank([pool[index] for index in indices], prefer_mixed_types=prefer_mixed_types),
+                indices,
+            )
+        )
+        frontier = next_frontier[: max(1, int(beam_size)) * 2]
+        depth += 1
 
-    by_type: dict[str, list[int]] = {}
-    for index, prediction in enumerate(pool):
-        by_type.setdefault(prediction.constraint_type, []).append(index)
-    positional = by_type.get("Coincident", []) + by_type.get("Concentric", [])
-    directional = by_type.get("Parallel", []) + by_type.get("Perpendicular", [])
-    for first in positional[:4]:
-        for second in directional[:4]:
-            add((first, second), bonus=-0.2)
-            if max_size >= 3:
-                for third in range(len(pool)):
-                    if third not in {first, second}:
-                        add((first, second, third), bonus=-0.15)
-                        break
+    target_sets.sort(key=lambda item: (item[1], item[0], item[2]))
+    return [[pool[index] for index in indices] for _, _, indices in target_sets[: max(1, int(beam_size))]]
 
-    target_sets.sort(key=lambda item: (item[0], item[1]))
-    return [[pool[index] for index in indices] for _, indices in target_sets[: max(1, int(beam_size))]]
+
+def _constraint_combo_rejection_reason(
+    constraints: Sequence[PredictionConstraint],
+) -> str | None:
+    if not constraints:
+        return "empty"
+
+    seen_exact: set[tuple[str, int, str, int, str]] = set()
+    face_pair_types: dict[tuple[str, int, str, int], set[str]] = {}
+    positional_by_face: dict[tuple[str, int], set[tuple[str, int]]] = {}
+
+    for constraint in constraints:
+        if constraint.part_a == constraint.part_b:
+            return "same_part"
+        if constraint.pair_key in seen_exact:
+            return "duplicate_constraint"
+        seen_exact.add(constraint.pair_key)
+
+        face_pair_types.setdefault(constraint.face_pair_key, set()).add(constraint.constraint_type)
+        reversed_face_pair = (constraint.part_b, constraint.face_b, constraint.part_a, constraint.face_a)
+        face_pair_types.setdefault(reversed_face_pair, set()).add(constraint.constraint_type)
+
+        if _is_positional_type(constraint.constraint_type):
+            face_a = (constraint.part_a, int(constraint.face_a))
+            face_b = (constraint.part_b, int(constraint.face_b))
+            positional_by_face.setdefault(face_a, set()).add(face_b)
+            positional_by_face.setdefault(face_b, set()).add(face_a)
+
+    for types in face_pair_types.values():
+        if "Parallel" in types and "Perpendicular" in types:
+            return "same_face_pair_parallel_and_perpendicular"
+
+    for opposite_faces in positional_by_face.values():
+        if len(opposite_faces) > 1:
+            return "one_face_has_multiple_positional_targets"
+
+    return None
 
 
 def _prediction_to_constraint(prediction: PredictionConstraint) -> dict[str, Any]:
@@ -986,6 +1068,10 @@ def _candidate_status_is_final(status: Any) -> bool:
     return str(status or "") in {"ok", "partial"}
 
 
+def _candidate_status_is_ok(status: Any) -> bool:
+    return str(status or "") == "ok"
+
+
 def _candidate_status_has_transform(status: Any) -> bool:
     return str(status or "") in {"ok", "partial", "collision"}
 
@@ -1038,6 +1124,87 @@ def _attempt_score(summary: dict[str, Any]) -> tuple[int, float, float, int]:
     mean_score = float(summary.get("mean_score") or 0.0)
     count = int(summary.get("constraint_count") or 0)
     return (status_rank, error_value, -mean_score, -count)
+
+
+def _export_prediction_candidate(
+    attempt: dict[str, Any],
+    selected_pool: Sequence[PredictionConstraint],
+    output_dir: Path,
+    *,
+    export_name: str,
+) -> dict[str, Any] | None:
+    summary = dict(attempt.get("summary") or {})
+    if summary.get("status") != "ok":
+        return None
+
+    records = attempt.get("records") or []
+    jobs = attempt.get("jobs") or []
+    assembly = attempt.get("assembly")
+    if not records or not jobs or assembly is None:
+        return None
+    if any(record.status != "ok" for record in records):
+        return None
+
+    candidates_dir = output_dir / "predict_candidates"
+    work_dir = candidates_dir / export_name
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    jobs_by_index = {job.index: job for job in jobs}
+    predictions_by_index = {prediction.index: prediction for prediction in selected_pool}
+    selected_predictions = [
+        predictions_by_index[int(item["prediction_index"])]
+        for item in summary.get("selected_prediction_refs") or []
+        if int(item.get("prediction_index") or 0) in predictions_by_index
+    ]
+
+    exported_records: list[dict[str, Any]] = []
+    step_paths: list[str] = []
+    for record in records:
+        matrix, matrix_source = _record_matrix(record)
+        if matrix is None:
+            return None
+        artifacts = save_solution_step(
+            assembly,
+            record,
+            work_dir,
+            transform=matrix,
+            use_pair_subdir=False,
+        )
+        assembled_step = Path(artifacts["step"]) if artifacts.get("step") else None
+        if assembled_step is None or not assembled_step.is_file():
+            return None
+        step_path = candidates_dir / f"{export_name}.step"
+        if len(records) > 1:
+            step_path = candidates_dir / f"{export_name}_pair{record.index:02d}.step"
+        if step_path.exists():
+            step_path.unlink()
+        assembled_step.replace(step_path)
+        step_paths.append(str(step_path.resolve()))
+        try:
+            work_dir.rmdir()
+        except OSError:
+            pass
+        exported_records.append(
+            _record_json(
+                record,
+                jobs_by_index[record.index],
+                assembly,
+                matrix=matrix,
+                matrix_source=matrix_source,
+                step_path=str(step_path.resolve()),
+            )
+        )
+
+    return _compact_json(
+        {
+            "name": export_name,
+            "status": "ok",
+            "step": step_paths[0] if len(step_paths) == 1 else None,
+            "steps": step_paths if len(step_paths) > 1 else None,
+            "attempt": summary,
+            "selected_predictions": [_prediction_json(item) for item in selected_predictions],
+            "results": exported_records,
+        }
+    )
 
 
 def _ok_samples_by_split(results: list[dict[str, Any]]) -> dict[str, list[str]]:

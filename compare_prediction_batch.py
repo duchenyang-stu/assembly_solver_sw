@@ -27,13 +27,14 @@ from reconstructed_solver.prediction_run import (
     _attempt_satisfies_selection_policy,
     _candidate_prediction_sets,
     _candidate_status_is_final,
+    _candidate_status_is_ok,
+    _export_prediction_candidate,
     _filter_prediction_pool,
     _prediction_constraints,
     _prediction_json,
     _selection_failure_reason,
     _solve_prediction_candidate,
 )
-from reconstructed_solver.visualize import save_solution_step
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-threshold", type=float, default=0.5)
     parser.add_argument("--max-predictions", type=int, default=16)
     parser.add_argument("--beam-size", type=int, default=24)
+    parser.add_argument("--max-saved-candidates", type=int, default=5)
     parser.add_argument("--min-constraints", type=int, default=1)
     parser.add_argument("--max-constraints", type=int, default=3)
     parser.add_argument(
@@ -137,6 +139,7 @@ def main() -> None:
         "score_threshold": float(args.score_threshold),
         "max_predictions": int(args.max_predictions),
         "beam_size": int(args.beam_size),
+        "max_saved_candidates": int(args.max_saved_candidates),
         "min_constraints": int(args.min_constraints),
         "max_constraints": int(args.max_constraints),
         "prefer_mixed_types": bool(args.prefer_mixed_types),
@@ -179,6 +182,7 @@ def main() -> None:
             "score_threshold": float(args.score_threshold),
             "max_predictions": int(args.max_predictions),
             "beam_size": int(args.beam_size),
+            "max_saved_candidates": int(args.max_saved_candidates),
             "min_constraints": int(args.min_constraints),
             "max_constraints": int(args.max_constraints),
             "prefer_mixed_types": bool(args.prefer_mixed_types),
@@ -299,6 +303,7 @@ def _process_compare_sample(
     )
 
     attempts: list[dict[str, Any]] = []
+    ok_candidate_results: list[dict[str, Any]] = []
     best_attempt: dict[str, Any] | None = None
     best_records = None
     best_jobs = None
@@ -350,12 +355,20 @@ def _process_compare_sample(
             best_policy_jobs = attempt.get("jobs")
             best_policy_assembly = attempt.get("assembly")
 
-        if _candidate_status_is_final(attempt["summary"].get("status")) and policy_ok:
-            best_attempt = attempt["summary"]
-            best_records = attempt.get("records")
-            best_jobs = attempt.get("jobs")
-            best_assembly = attempt.get("assembly")
-            break
+        if _candidate_status_is_ok(attempt["summary"].get("status")) and policy_ok:
+            ok_candidate_results.append(attempt)
+            if len(ok_candidate_results) >= max(1, int(context["max_saved_candidates"])):
+                best_attempt = best_policy_attempt or attempt["summary"]
+                best_records = best_policy_records or attempt.get("records")
+                best_jobs = best_policy_jobs or attempt.get("jobs")
+                best_assembly = best_policy_assembly or attempt.get("assembly")
+                break
+
+        if _candidate_status_is_final(attempt["summary"].get("status")) and policy_ok and best_policy_attempt is not None:
+            best_attempt = best_policy_attempt
+            best_records = best_policy_records
+            best_jobs = best_policy_jobs
+            best_assembly = best_policy_assembly
 
     selection_policy_satisfied = best_policy_attempt is not None
     if selection_policy_satisfied:
@@ -375,31 +388,30 @@ def _process_compare_sample(
         if int(item.get("prediction_index") or 0) in predictions_by_index
     ]
 
+    saved_prediction_candidates: list[dict[str, Any]] = []
+    for saved_rank, ok_attempt in enumerate(ok_candidate_results[: max(1, int(context["max_saved_candidates"]))], start=1):
+        saved = _export_prediction_candidate(
+            ok_attempt,
+            selected_pool,
+            output_dir,
+            export_name=f"candidate_{saved_rank:03d}",
+        )
+        if saved:
+            saved_prediction_candidates.append(saved)
+
     predict_results = []
-    if best_records and best_jobs and best_assembly:
+    best_saved_step = _first_candidate_step(saved_prediction_candidates)
+    if best_records and best_jobs and best_assembly and best_saved_step:
         jobs_by_index = {job.index: job for job in best_jobs}
         for record in best_records:
             matrix, matrix_source = _record_matrix(record)
-            should_export = matrix is not None and (record.status == "ok" or bool(context["export_rejected"]))
-            artifacts = (
-                save_solution_step(
-                    best_assembly,
-                    record,
-                    output_dir,
-                    transform=matrix,
-                    use_pair_subdir=False,
-                )
-                if should_export
-                else {}
-            )
-            predicted_step = None
-            assembled_step = Path(artifacts["step"]) if artifacts.get("step") else None
-            if assembled_step and assembled_step.is_file():
-                predicted_step_path = output_dir / "predict_brepnet.step"
-                if predicted_step_path.exists():
-                    predicted_step_path.unlink()
-                assembled_step.replace(predicted_step_path)
-                predicted_step = str(predicted_step_path)
+            if matrix is None or record.status != "ok":
+                continue
+            predicted_step_path = output_dir / "predict_brepnet.step"
+            if predicted_step_path.exists():
+                predicted_step_path.unlink()
+            shutil.copy2(best_saved_step, predicted_step_path)
+            predicted_step = str(predicted_step_path)
             item = _record_json(
                 record,
                 jobs_by_index[record.index],
@@ -441,9 +453,11 @@ def _process_compare_sample(
             "status": predict_status,
             "selection": {
                 "strategy": "beam_search_with_solver_validation",
+                "search_order": "rule_pruned_incremental_addition",
                 "score_threshold": float(context["score_threshold"]),
                 "max_predictions": int(context["max_predictions"]),
                 "beam_size": int(context["beam_size"]),
+                "max_saved_candidates": int(context["max_saved_candidates"]),
                 "min_constraints": int(context["min_constraints"]),
                 "max_constraints": int(context["max_constraints"]),
                 "allow_direction_only": bool(context["allow_direction_only"]),
@@ -455,6 +469,7 @@ def _process_compare_sample(
                 "rejected": rejected_predictions,
                 "selected_attempt": best_attempt,
                 "selected_predictions": [_prediction_json(item) for item in selected_predictions],
+                "saved_ok_candidates": saved_prediction_candidates,
                 "attempts": attempts,
             },
             "results": predict_results,
@@ -497,6 +512,16 @@ def _first_predict_step(results: Sequence[dict[str, Any]]) -> str | None:
     for item in results:
         if item.get("step"):
             return str(item["step"])
+    return None
+
+
+def _first_candidate_step(candidates: Sequence[dict[str, Any]]) -> str | None:
+    for item in candidates:
+        if item.get("step"):
+            return str(item["step"])
+        steps = item.get("steps") or []
+        if steps:
+            return str(steps[0])
     return None
 
 

@@ -951,6 +951,39 @@ class PairAssemblySolver:
         return translation
 
     @staticmethod
+    def _tangent_signed_distances(radius: float, orientation: int) -> List[float]:
+        radius = abs(float(radius))
+        if int(orientation) == 1:
+            return [radius]
+        if int(orientation) == 2:
+            return [-radius]
+        if radius < 1e-9:
+            return [0.0]
+        return [radius, -radius]
+
+    @staticmethod
+    def _projected_or_perpendicular(direction: Sequence[float], normal: Sequence[float]) -> np.ndarray:
+        normal_vec = normalize(normal)
+        direction_vec = np.asarray(direction, dtype=float)
+        projected = direction_vec - float(np.dot(direction_vec, normal_vec)) * normal_vec
+        if np.linalg.norm(projected) < 1e-8:
+            projected = arbitrary_perpendicular(normal_vec)
+        return normalize(projected)
+
+    @staticmethod
+    def _line_line_offset_direction(
+        moving_axis_point: Sequence[float],
+        fixed_axis_point: Sequence[float],
+        axis: Sequence[float],
+    ) -> np.ndarray:
+        axis_vec = normalize(axis)
+        delta = np.asarray(moving_axis_point, dtype=float) - np.asarray(fixed_axis_point, dtype=float)
+        perpendicular = delta - float(np.dot(delta, axis_vec)) * axis_vec
+        if np.linalg.norm(perpendicular) < 1e-8:
+            perpendicular = arbitrary_perpendicular(axis_vec)
+        return normalize(perpendicular)
+
+    @staticmethod
     def _rotation_from_direction_pairs(direction_pairs: Sequence[Tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
         pairs = [(normalize(source), normalize(target)) for source, target in direction_pairs]
         if not pairs:
@@ -978,7 +1011,7 @@ class PairAssemblySolver:
             fixed_feature = self._feature_for(fixed_ref)
 
             if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, PlaneFeature):
-                if constraint.kind == "coincident":
+                if constraint.kind in {"coincident", "tangent"}:
                     if int(constraint.orientation) == 0:
                         continue
                     normal_sign = -1.0 if int(constraint.orientation) == 2 else 1.0
@@ -1014,7 +1047,7 @@ class PairAssemblySolver:
                 )
 
             if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, CylinderFeature):
-                if constraint.kind in {"coincident", "concentric"}:
+                if constraint.kind in {"coincident", "concentric", "tangent"}:
                     axis_sign = 1.0 if float(np.dot(moving_feature.axis, fixed_feature.axis)) >= 0.0 else -1.0
                     direction_pairs.append((moving_feature.axis, axis_sign * fixed_feature.axis))
                     continue
@@ -1022,6 +1055,18 @@ class PairAssemblySolver:
                 raise NotImplementedError(
                     f"{constraint.name}: analytic fallback does not support cylinder-cylinder '{constraint.kind}'."
                 )
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, PlaneFeature):
+                if constraint.kind == "tangent":
+                    target_axis = self._projected_or_perpendicular(moving_feature.axis, fixed_feature.normal)
+                    direction_pairs.append((moving_feature.axis, target_axis))
+                    continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, CylinderFeature):
+                if constraint.kind == "tangent":
+                    target_normal = self._projected_or_perpendicular(moving_feature.normal, fixed_feature.axis)
+                    direction_pairs.append((moving_feature.normal, target_normal))
+                    continue
 
             raise NotImplementedError(
                 f"{constraint.name}: analytic fallback does not support "
@@ -1048,7 +1093,7 @@ class PairAssemblySolver:
                 normal = normalize(fixed_feature.normal)
                 moved_point_without_translation = self._mat3_vec_mul(rotation, moving_feature.point)
 
-                if constraint.kind == "coincident":
+                if constraint.kind in {"coincident", "tangent"}:
                     base_rows.append(normal)
                     base_values.append(float(np.dot(normal, fixed_feature.point - moved_point_without_translation)))
                     continue
@@ -1086,6 +1131,59 @@ class PairAssemblySolver:
                     for basis_vector in (arbitrary_perpendicular(axis), normalize(np.cross(axis, arbitrary_perpendicular(axis)))):
                         base_rows.append(np.asarray(basis_vector, dtype=float))
                         base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+                if constraint.kind == "tangent":
+                    axis = normalize(fixed_feature.axis)
+                    moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point)
+                    separation = abs(float(moving_feature.radius)) + abs(float(fixed_feature.radius))
+                    offset_direction = self._line_line_offset_direction(
+                        moved_axis_point,
+                        fixed_feature.axis_point,
+                        axis,
+                    )
+                    target_point = fixed_feature.axis_point + separation * offset_direction
+                    basis_a = arbitrary_perpendicular(axis)
+                    basis_b = normalize(np.cross(axis, basis_a))
+                    for basis_vector in (basis_a, basis_b):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, target_point - moved_axis_point)))
+                    continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, PlaneFeature):
+                if constraint.kind == "tangent":
+                    normal = normalize(fixed_feature.normal)
+                    moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point)
+                    options: List[Tuple[str, np.ndarray, float]] = []
+                    for signed_distance in self._tangent_signed_distances(
+                        moving_feature.radius,
+                        constraint.orientation,
+                    ):
+                        rhs = float(
+                            signed_distance
+                            + np.dot(normal, fixed_feature.point)
+                            - np.dot(normal, moved_axis_point)
+                        )
+                        options.append((constraint.name, normal, rhs))
+                    distance_options.append(options)
+                    continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, CylinderFeature):
+                if constraint.kind == "tangent":
+                    moved_plane_point = self._mat3_vec_mul(rotation, moving_feature.point)
+                    moved_normal = normalize(self._mat3_vec_mul(rotation, moving_feature.normal))
+                    options: List[Tuple[str, np.ndarray, float]] = []
+                    for signed_distance in self._tangent_signed_distances(
+                        fixed_feature.radius,
+                        constraint.orientation,
+                    ):
+                        rhs = float(
+                            np.dot(moved_normal, fixed_feature.axis_point - moved_plane_point)
+                            - signed_distance
+                        )
+                        options.append((constraint.name, moved_normal, rhs))
+                    distance_options.append(options)
+                    continue
 
         option_products = itertools.product(*distance_options) if distance_options else [()]
         candidates: List[Tuple[np.ndarray, List[Tuple[str, float]]]] = []
@@ -1124,7 +1222,7 @@ class PairAssemblySolver:
                 fixed_normal = normalize(fixed_feature.normal)
                 signed_offset = float(np.dot(fixed_normal, moved_point - fixed_feature.point))
 
-                if constraint.kind == "coincident":
+                if constraint.kind in {"coincident", "tangent"}:
                     errors.append((constraint.name, "plane_offset", abs(signed_offset)))
                     if int(constraint.orientation) != 0:
                         target_normal = -fixed_normal if int(constraint.orientation) == 2 else fixed_normal
@@ -1166,7 +1264,42 @@ class PairAssemblySolver:
                 axis_parallel_error = abs(1.0 - abs(float(np.dot(moved_axis, fixed_axis))))
                 axis_separation = float(np.linalg.norm(np.cross(moved_axis_point - fixed_feature.axis_point, fixed_axis)))
                 errors.append((constraint.name, "axis_parallel", axis_parallel_error))
-                errors.append((constraint.name, "axis_separation", axis_separation))
+                if constraint.kind == "tangent":
+                    target_separation = abs(float(moving_feature.radius)) + abs(float(fixed_feature.radius))
+                    errors.append((constraint.name, "axis_tangent_distance", abs(axis_separation - target_separation)))
+                else:
+                    errors.append((constraint.name, "axis_separation", axis_separation))
+                continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, PlaneFeature):
+                moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point) + translation
+                moved_axis = normalize(self._mat3_vec_mul(rotation, moving_feature.axis))
+                fixed_normal = normalize(fixed_feature.normal)
+                signed_offset = float(np.dot(fixed_normal, moved_axis_point - fixed_feature.point))
+                errors.append((constraint.name, "axis_plane_parallel", abs(float(np.dot(moved_axis, fixed_normal)))))
+                errors.append(
+                    (
+                        constraint.name,
+                        "plane_cylinder_tangent_distance",
+                        abs(abs(signed_offset) - abs(float(moving_feature.radius))),
+                    )
+                )
+                continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, CylinderFeature):
+                moved_plane_point = self._mat3_vec_mul(rotation, moving_feature.point) + translation
+                moved_normal = normalize(self._mat3_vec_mul(rotation, moving_feature.normal))
+                fixed_axis = normalize(fixed_feature.axis)
+                signed_offset = float(np.dot(moved_normal, fixed_feature.axis_point - moved_plane_point))
+                errors.append((constraint.name, "axis_plane_parallel", abs(float(np.dot(fixed_axis, moved_normal)))))
+                errors.append(
+                    (
+                        constraint.name,
+                        "plane_cylinder_tangent_distance",
+                        abs(abs(signed_offset) - abs(float(fixed_feature.radius))),
+                    )
+                )
+                continue
 
         return errors
 
