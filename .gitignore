@@ -1,3 +1,6 @@
 __pycache__/
 output*/
 batch_output/
+ok_test_prediction_candidate/
+ok_test_prediction_compare/
+ok_test_prediction_othertype/

@@ -424,14 +424,36 @@ class StepFeatureExtractor:
         )
 
 
-def first_face_index(element: dict, face_index_base: int = 0) -> int:
-    for key in ("matched_face_idx", "face_idx"):
+def first_face_index(
+    element: dict,
+    face_index_base: int = 0,
+    *,
+    verified_face_pairs: Optional[Sequence[dict]] = None,
+) -> int:
+    for key in ("verified_face_idx", "verified_face_id", "face_idx"):
         value = element.get(key)
         if isinstance(value, list) and value:
             return int(value[0]) - face_index_base
         if isinstance(value, int):
             return int(value) - face_index_base
-    raise ValueError(f"Constraint element does not contain a face index: {element}")
+
+    part_name = str(element.get("part_name") or element.get("part_id") or "").strip()
+    if verified_face_pairs and part_name:
+        for pair in verified_face_pairs:
+            value = pair.get(part_name)
+            if isinstance(value, list) and value:
+                return int(value[0]) - face_index_base
+            if isinstance(value, int):
+                return int(value) - face_index_base
+
+    for key in ("matched_face_idx",):
+        value = element.get(key)
+        if isinstance(value, list) and value:
+            return int(value[0]) - face_index_base
+        if isinstance(value, int):
+            return int(value) - face_index_base
+
+    raise ValueError(f"Constraint element does not contain a verified face index: {element}")
 
 
 def normalize_constraint_kind(constraint: dict) -> str:
@@ -494,12 +516,17 @@ def extract_constraints(data: dict, face_index_base: int = 0) -> List[PairConstr
         if len(elements) != 2:
             continue
 
+        verified_face_pairs = item.get("verified_face_pairs") or []
         refs = []
         for element in elements:
             refs.append(
                 ConstraintRef(
                     part_name=str(element.get("part_name") or element.get("part_id") or "").strip(),
-                    face_index=first_face_index(element, face_index_base=face_index_base),
+                    face_index=first_face_index(
+                        element,
+                        face_index_base=face_index_base,
+                        verified_face_pairs=verified_face_pairs,
+                    ),
                     face_type=str(element.get("face_type") or "").strip(),
                 )
             )
