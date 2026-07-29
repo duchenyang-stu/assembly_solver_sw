@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--predictions-json", default=str(Path(__file__).resolve().parent / "predictions_test.json"))
     parser.add_argument("--ok-json", default=str(Path(__file__).resolve().parent / "batch_output" / "ok_test.json"))
+    parser.add_argument(
+        "--manifest-json",
+        default=None,
+        help="Optional manifest mapping constraint combination labels to assembly ids. Overrides --ok-json selection.",
+    )
     parser.add_argument("--gt-output-root", default=str(Path(__file__).resolve().parent / "batch_output"))
     parser.add_argument(
         "--json-root",
@@ -61,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--group-by-gt-constraints",
+        action="store_true",
+        help="Write samples under output-dir/<GT constraint combination>/<assembly_id>.",
+    )
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--face-index-base", type=int, default=0, choices=(0, 1))
     parser.add_argument(
@@ -99,24 +109,38 @@ def main() -> None:
     args = parse_args()
     predictions_json = Path(args.predictions_json).resolve()
     ok_json = Path(args.ok_json).resolve()
+    manifest_json = Path(args.manifest_json).resolve() if args.manifest_json else None
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ok_ids = _load_ok_ids(ok_json, args.split)
+    manifest_items = _load_manifest_items(manifest_json) if manifest_json else None
+    ok_ids = [item["assembly_id"] for item in manifest_items] if manifest_items is not None else _load_ok_ids(ok_json, args.split)
     predictions_by_id = {
         str(item.get("assembly_id")): item
         for item in json.loads(predictions_json.read_text(encoding="utf-8-sig"))
         if isinstance(item, dict) and item.get("assembly_id")
     }
-    tasks = [
-        {
-            "batch_index": index,
-            "assembly_id": assembly_id,
-            "prediction_item": predictions_by_id[assembly_id],
-        }
-        for index, assembly_id in enumerate(ok_ids, start=1)
-        if assembly_id in predictions_by_id
-    ]
+    if manifest_items is not None:
+        tasks = [
+            {
+                "batch_index": index,
+                "assembly_id": item["assembly_id"],
+                "constraint_label": item["constraint_label"],
+                "prediction_item": predictions_by_id[item["assembly_id"]],
+            }
+            for index, item in enumerate(manifest_items, start=1)
+            if item["assembly_id"] in predictions_by_id
+        ]
+    else:
+        tasks = [
+            {
+                "batch_index": index,
+                "assembly_id": assembly_id,
+                "prediction_item": predictions_by_id[assembly_id],
+            }
+            for index, assembly_id in enumerate(ok_ids, start=1)
+            if assembly_id in predictions_by_id
+        ]
     tasks = tasks[int(args.offset) :]
     if args.limit is not None:
         tasks = tasks[: int(args.limit)]
@@ -146,6 +170,7 @@ def main() -> None:
         "allow_direction_only": bool(args.allow_direction_only),
         "export_rejected": bool(args.export_rejected),
         "skip_existing": bool(args.skip_existing),
+        "group_by_gt_constraints": bool(args.group_by_gt_constraints),
     }
     for task in tasks:
         task["context"] = context
@@ -171,6 +196,7 @@ def main() -> None:
     summary = {
         "predictions_json": str(predictions_json),
         "ok_json": str(ok_json),
+        "manifest_json": str(manifest_json) if manifest_json else None,
         "gt_output_root": str(Path(args.gt_output_root).resolve()),
         "output_dir": str(output_dir),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -222,7 +248,13 @@ def _run_compare_task(task: dict[str, Any]) -> dict[str, Any]:
     context = dict(task["context"])
     assembly_id = str(task["assembly_id"])
     split = _split_stem(context["split"])
-    output_dir = Path(context["output_dir"]) / split / assembly_id
+    output_parent = Path(context["output_dir"]) / split
+    if task.get("constraint_label"):
+        output_parent = Path(context["output_dir"]) / _safe_label(str(task["constraint_label"]))
+    elif context.get("group_by_gt_constraints"):
+        gt_summary_path = Path(context["gt_output_root"]) / split / assembly_id / f"{assembly_id}.json"
+        output_parent = Path(context["output_dir"]) / _gt_constraint_combination_label(gt_summary_path)
+    output_dir = output_parent / assembly_id
     summary_path = output_dir / f"{assembly_id}.json"
     if context["skip_existing"] and summary_path.exists():
         return _compact_json(
@@ -241,6 +273,7 @@ def _run_compare_task(task: dict[str, Any]) -> dict[str, Any]:
         return _process_compare_sample(
             batch_index=int(task["batch_index"]),
             assembly_id=assembly_id,
+            constraint_label=task.get("constraint_label"),
             prediction_item=dict(task["prediction_item"]),
             output_dir=output_dir,
             summary_path=summary_path,
@@ -266,12 +299,18 @@ def _process_compare_sample(
     batch_index: int,
     assembly_id: str,
     prediction_item: dict[str, Any],
+    constraint_label: Any,
     output_dir: Path,
     summary_path: Path,
     context: dict[str, Any],
 ) -> dict[str, Any]:
     split = _split_stem(context["split"])
-    gt_dir = Path(context["gt_output_root"]) / split / assembly_id
+    gt_root = Path(context["gt_output_root"])
+    gt_dir = gt_root / split / assembly_id
+    if constraint_label:
+        manifest_gt_dir = gt_root / _safe_label(str(constraint_label)) / assembly_id
+        if manifest_gt_dir.is_dir():
+            gt_dir = manifest_gt_dir
     gt_summary_path = gt_dir / f"{assembly_id}.json"
     gt_step_source = gt_dir / "assembled.step"
     if not gt_summary_path.is_file():
@@ -398,6 +437,8 @@ def _process_compare_sample(
         )
         if saved:
             saved_prediction_candidates.append(saved)
+            candidate_json = output_dir / "predict_candidates" / f"{saved['name']}.json"
+            candidate_json.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
 
     predict_results = []
     best_saved_step = _first_candidate_step(saved_prediction_candidates)
@@ -506,6 +547,55 @@ def _load_ok_ids(path: Path, split: str) -> list[str]:
     else:
         values = payload
     return [Path(str(item)).stem for item in values]
+
+
+def _load_manifest_items(path: Path) -> list[dict[str, str]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Manifest must map constraint labels to assembly ids: {path}")
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for label, ids in payload.items():
+        if not isinstance(ids, list):
+            continue
+        for value in ids:
+            assembly_id = Path(str(value)).stem
+            if not assembly_id or assembly_id in seen:
+                continue
+            seen.add(assembly_id)
+            items.append({"constraint_label": str(label), "assembly_id": assembly_id})
+    return items
+
+
+def _safe_label(value: str) -> str:
+    return value.strip().replace("/", "_") or "Unknown"
+
+
+def _gt_constraint_combination_label(summary_path: Path) -> str:
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "Unknown"
+    result = (payload.get("results") or [{}])[0]
+    constraints = result.get("constraints") or []
+    kinds = [_constraint_kind_label(item) for item in constraints if isinstance(item, dict)]
+    kinds = [item for item in kinds if item]
+    return "+".join(sorted(kinds)) or "Unknown"
+
+
+def _constraint_kind_label(constraint: dict[str, Any]) -> str | None:
+    raw = constraint.get("source_kind") or constraint.get("kind") or constraint.get("type")
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    mapping = {
+        "coincident": "Coincident",
+        "concentric": "Concentric",
+        "parallel": "Parallel",
+        "perpendicular": "Perpendicular",
+        "tangent": "Tangent",
+    }
+    return mapping.get(value.lower(), value[:1].upper() + value[1:])
 
 
 def _first_predict_step(results: Sequence[dict[str, Any]]) -> str | None:

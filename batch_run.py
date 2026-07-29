@@ -546,6 +546,7 @@ def _convert_constraint_payload(
     step_root: Path,
     step_index: dict[str, Path] | None,
 ) -> dict[str, Any]:
+    payload = _strip_answer_fields(payload)
     part_names = _extract_part_names(payload)
     constraints = []
     for index, constraint in enumerate(payload.get("internal_constraints") or payload.get("constraints") or []):
@@ -579,6 +580,20 @@ def _convert_constraint_payload(
         "parts": parts,
         "internal_constraints": constraints,
     }
+
+
+def _strip_answer_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    stripped = dict(payload)
+    for key in (
+        "transform",
+        "solution_transform",
+        "rejected_transform",
+        "applied_transform",
+        "candidate_transform",
+        "ground_truth_transform",
+    ):
+        stripped.pop(key, None)
+    return stripped
 
 
 def _extract_part_names(payload: dict[str, Any]) -> list[str]:

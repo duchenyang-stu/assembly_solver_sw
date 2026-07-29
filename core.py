@@ -1075,7 +1075,12 @@ class PairAssemblySolver:
 
             if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, CylinderFeature):
                 if constraint.kind in {"coincident", "concentric", "tangent"}:
-                    axis_sign = 1.0 if float(np.dot(moving_feature.axis, fixed_feature.axis)) >= 0.0 else -1.0
+                    if int(constraint.orientation) == 1:
+                        axis_sign = 1.0
+                    elif int(constraint.orientation) == 2:
+                        axis_sign = -1.0
+                    else:
+                        axis_sign = 1.0 if float(np.dot(moving_feature.axis, fixed_feature.axis)) >= 0.0 else -1.0
                     direction_pairs.append((moving_feature.axis, axis_sign * fixed_feature.axis))
                     continue
 

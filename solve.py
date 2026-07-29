@@ -93,6 +93,7 @@ class _CandidateOutcome:
     label: str
     constraints: list[core.PairConstraint]
     flipped_constraints: list[str]
+    omitted_constraints: list[str]
     solver: StrictPairAssemblySolver | None = None
     transform: list[list[float]] | np.ndarray | None = None
     solver_used: str | None = None
@@ -150,13 +151,14 @@ def solve_jobs(
                 label,
                 constraints,
                 flipped_constraints,
+                omitted_constraints,
                 solver_mode,
                 max_error=max_error,
                 reject_high_error=reject_high_error,
                 avoid_interference=avoid_interference,
                 settings=settings,
             )
-            for label, constraints, flipped_constraints in _candidate_constraint_sets(job)
+            for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(job)
         ]
         candidate_results = [_candidate_summary(outcome) for outcome in outcomes]
         acceptable = [
@@ -169,8 +171,9 @@ def solve_jobs(
             )
         ]
 
-        if acceptable:
-            outcome = min(acceptable, key=_candidate_score)
+        complete_acceptable = [outcome for outcome in acceptable if not outcome.omitted_constraints]
+        if complete_acceptable:
+            outcome = min(complete_acceptable, key=_candidate_score)
             diagnosis = outcome.solver.diagnose_transform(outcome.transform)
             records.append(
                 SolveRecord(
@@ -193,9 +196,41 @@ def solve_jobs(
             )
             continue
 
+        if acceptable:
+            outcome = min(acceptable, key=_candidate_score)
+            diagnosis = outcome.solver.diagnose_transform(outcome.transform)
+            records.append(
+                SolveRecord(
+                    job.index,
+                    job.fixed_part,
+                    job.moving_part,
+                    names,
+                    kinds,
+                    "partial",
+                    solver_mode,
+                    core.matrix_to_list(outcome.transform),
+                    solver_used=outcome.solver_used,
+                    max_constraint_error=float(diagnosis["max_error"]),
+                    primary_error=outcome.primary_error,
+                    collision=outcome.collision,
+                    collision_adjusted=outcome.collision_adjusted,
+                    selected_candidate=outcome.label,
+                    candidate_results=candidate_results,
+                    error=(
+                        "Solved a degraded constraint set after omitting: "
+                        + ", ".join(outcome.omitted_constraints)
+                    ),
+                )
+            )
+            continue
+
         transform_outcomes = [outcome for outcome in outcomes if outcome.has_transform]
         if transform_outcomes:
-            outcome = min(transform_outcomes, key=_candidate_score)
+            complete_transform_outcomes = [
+                outcome for outcome in transform_outcomes if not outcome.omitted_constraints
+            ]
+            outcome_pool = complete_transform_outcomes or transform_outcomes
+            outcome = min(outcome_pool, key=_candidate_score)
             records.append(
                 SolveRecord(
                     job.index,
@@ -243,6 +278,7 @@ def _evaluate_candidate(
     label: str,
     constraints: list[core.PairConstraint],
     flipped_constraints: list[str],
+    omitted_constraints: list[str],
     solver_mode: str,
     *,
     max_error: float,
@@ -250,7 +286,7 @@ def _evaluate_candidate(
     avoid_interference: bool,
     settings: CollisionSettings,
 ) -> _CandidateOutcome:
-    outcome = _CandidateOutcome(label, constraints, flipped_constraints)
+    outcome = _CandidateOutcome(label, constraints, flipped_constraints, omitted_constraints)
     try:
         solver = StrictPairAssemblySolver(
             fixed_part=job.fixed_part,
@@ -295,41 +331,148 @@ def _evaluate_candidate(
     return outcome
 
 
-def _candidate_constraint_sets(job: PairJob) -> list[tuple[str, list[core.PairConstraint], list[str]]]:
-    candidates: list[tuple[str, list[core.PairConstraint], list[str]]] = [
-        ("primary", list(job.constraints), [])
+def _candidate_constraint_sets(
+    job: PairJob,
+) -> list[tuple[str, list[core.PairConstraint], list[str], list[str]]]:
+    constraints = _sort_constraints_for_solving(job.constraints)
+    candidates: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
+    seen: set[tuple[tuple[str, int], ...]] = set()
+
+    def add_candidate(
+        label: str,
+        candidate_constraints: list[core.PairConstraint],
+        flipped_constraints: list[str] | None = None,
+        omitted_constraints: list[str] | None = None,
+    ) -> None:
+        ordered = _sort_constraints_for_solving(candidate_constraints)
+        if not ordered:
+            return
+        key = tuple((constraint.name, int(constraint.orientation)) for constraint in ordered)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((label, ordered, list(flipped_constraints or []), list(omitted_constraints or [])))
+
+    add_candidate("primary", constraints)
+
+    flippable_coincident = [constraint.name for constraint in constraints if _is_oriented_plane_coincident(constraint)]
+    flippable_tangent = [
+        constraint.name
+        for constraint in constraints
+        if constraint.kind == "tangent" and int(constraint.orientation) in {1, 2}
     ]
+    if flippable_coincident:
+        add_candidate(
+            "flipped_coincident_orientation",
+            _flip_named_orientations(constraints, set(flippable_coincident)),
+            flippable_coincident,
+        )
+    if flippable_tangent:
+        add_candidate(
+            "flipped_tangent_orientation",
+            _flip_named_orientations(constraints, set(flippable_tangent)),
+            flippable_tangent,
+        )
+    if flippable_coincident and flippable_tangent:
+        flipped_names = flippable_coincident + flippable_tangent
+        add_candidate(
+            "flipped_coincident_and_tangent_orientation",
+            _flip_named_orientations(constraints, set(flipped_names)),
+            flipped_names,
+        )
 
-    flipped: list[core.PairConstraint] = []
-    flipped_names: list[str] = []
-    for constraint in job.constraints:
-        if _is_oriented_plane_coincident(constraint):
-            flipped_orientation = 1 if int(constraint.orientation) == 2 else 2
-            flipped.append(replace(constraint, orientation=flipped_orientation))
-            flipped_names.append(constraint.name)
-        else:
-            flipped.append(constraint)
-    if flipped_names:
-        candidates.append(("flipped_coincident_orientation", flipped, flipped_names))
+    # Individual flips catch common mixed-orientation cases without exploding the
+    # search space on dense prediction sets.
+    for constraint_name in (flippable_coincident + flippable_tangent)[:8]:
+        add_candidate(
+            f"flipped_orientation:{constraint_name}",
+            _flip_named_orientations(constraints, {constraint_name}),
+            [constraint_name],
+        )
 
-    flipped_tangent: list[core.PairConstraint] = []
-    flipped_tangent_names: list[str] = []
-    for constraint in job.constraints:
-        if constraint.kind == "tangent" and int(constraint.orientation) in {1, 2}:
-            flipped_orientation = 1 if int(constraint.orientation) == 2 else 2
-            flipped_tangent.append(replace(constraint, orientation=flipped_orientation))
-            flipped_tangent_names.append(constraint.name)
-        else:
-            flipped_tangent.append(constraint)
-    if flipped_tangent_names:
-        candidates.append(("flipped_tangent_orientation", flipped_tangent, flipped_tangent_names))
+    for label, subset in _degraded_constraint_subsets(constraints):
+        omitted = [constraint.name for constraint in constraints if constraint.name not in {item.name for item in subset}]
+        add_candidate(label, subset, [], omitted)
     return candidates
 
 
 def _is_oriented_plane_coincident(constraint: core.PairConstraint) -> bool:
     if constraint.kind != "coincident" or int(constraint.orientation) not in {1, 2}:
         return False
-    return all(ref.face_type.strip().lower() == "plane" for ref in constraint.refs)
+    # Many source payloads do not carry face_type, so requiring "plane" here
+    # prevents coplanar side alternatives from being explored. Non-planar
+    # coincident flips are still scored by residual and collision checks.
+    return True
+
+
+def _constraint_strength_rank(constraint: core.PairConstraint) -> tuple[int, int, str]:
+    kind = constraint.kind
+    face_types = {ref.face_type.strip().lower() for ref in constraint.refs}
+    if kind in {"coincident", "concentric"}:
+        tier = 0
+    elif kind == "distance":
+        tier = 1
+    elif kind == "tangent" and face_types == {"plane"}:
+        # Plane-plane tangent is modeled as coincidence in this solver.
+        tier = 1
+    elif kind in {"perpendicular", "angle"}:
+        tier = 2
+    elif kind == "parallel":
+        tier = 3
+    elif kind == "tangent":
+        tier = 4
+    else:
+        tier = 5
+    return (tier, int(constraint.orientation), constraint.name)
+
+
+def _sort_constraints_for_solving(
+    constraints: list[core.PairConstraint] | tuple[core.PairConstraint, ...],
+) -> list[core.PairConstraint]:
+    return sorted(list(constraints), key=_constraint_strength_rank)
+
+
+def _flip_named_orientations(
+    constraints: list[core.PairConstraint],
+    names: set[str],
+) -> list[core.PairConstraint]:
+    flipped: list[core.PairConstraint] = []
+    for constraint in constraints:
+        if constraint.name in names and int(constraint.orientation) in {1, 2}:
+            flipped_orientation = 1 if int(constraint.orientation) == 2 else 2
+            flipped.append(replace(constraint, orientation=flipped_orientation))
+        else:
+            flipped.append(constraint)
+    return flipped
+
+
+def _degraded_constraint_subsets(
+    constraints: list[core.PairConstraint],
+) -> list[tuple[str, list[core.PairConstraint]]]:
+    if len(constraints) <= 1:
+        return []
+
+    anchors = [
+        constraint
+        for constraint in constraints
+        if constraint.kind in {"coincident", "concentric", "distance"}
+        or (constraint.kind == "tangent" and {ref.face_type.strip().lower() for ref in constraint.refs} == {"plane"})
+    ]
+    non_tangent = [constraint for constraint in constraints if constraint.kind != "tangent"]
+    positional_orientation = [
+        constraint
+        for constraint in constraints
+        if constraint.kind in {"coincident", "concentric", "distance", "parallel", "perpendicular", "angle"}
+    ]
+
+    subsets: list[tuple[str, list[core.PairConstraint]]] = []
+    if anchors and len(anchors) < len(constraints):
+        subsets.append(("degraded_anchor_only", anchors))
+    if anchors and non_tangent and len(non_tangent) < len(constraints):
+        subsets.append(("degraded_without_tangent", non_tangent))
+    if positional_orientation and len(positional_orientation) < len(constraints):
+        subsets.append(("degraded_without_contact", positional_orientation))
+    return subsets
 
 
 def _candidate_is_acceptable(
@@ -348,7 +491,7 @@ def _candidate_is_acceptable(
     return metrics.get("status") in {"clearance", "contact"}
 
 
-def _candidate_score(outcome: _CandidateOutcome) -> tuple[float, float, float, float, float, int]:
+def _candidate_score(outcome: _CandidateOutcome) -> tuple[float, float, float, float, float, int, int]:
     metrics = _candidate_final_metrics(outcome)
     status = str(metrics.get("status") or "")
     if status in {"clearance", "contact", ""}:
@@ -361,8 +504,9 @@ def _candidate_score(outcome: _CandidateOutcome) -> tuple[float, float, float, f
     bbox_overlap = float(metrics.get("bbox_overlap_volume") or 0.0)
     min_distance = float(metrics.get("min_distance") or 0.0)
     max_error = float(outcome.max_constraint_error if outcome.max_constraint_error is not None else 1e9)
+    omitted_count = len(outcome.omitted_constraints)
     priority = 0 if outcome.label == "primary" else 1
-    return (collision_rank, common_volume, bbox_overlap, max_error, -min_distance, priority)
+    return (collision_rank, common_volume, bbox_overlap, max_error, -min_distance, omitted_count, priority)
 
 
 def _candidate_final_metrics(outcome: _CandidateOutcome) -> dict[str, Any]:
@@ -378,6 +522,10 @@ def _candidate_summary(outcome: _CandidateOutcome) -> dict[str, Any]:
         "flipped_constraints": outcome.flipped_constraints,
         "status": "error" if outcome.error else "solved",
         "solver_used": outcome.solver_used,
+        "constraint_names": [constraint.name for constraint in outcome.constraints],
+        "constraint_kinds": [constraint.kind for constraint in outcome.constraints],
+        "omitted_constraints": outcome.omitted_constraints,
+        "degraded": bool(outcome.omitted_constraints),
         "max_constraint_error": outcome.max_constraint_error,
         "collision_status": metrics.get("status"),
         "common_volume": metrics.get("common_volume"),
