@@ -5,6 +5,7 @@ import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+import math
 
 import numpy as np
 
@@ -38,6 +39,7 @@ class SolveRecord:
     collision_adjusted: bool | None = None
     rejected_transform: list[list[float]] | None = None
     selected_candidate: str | None = None
+    selected_variant: str | None = None
     candidate_results: list[dict[str, Any]] | None = None
     error: str | None = None
     traceback: str | None = None
@@ -94,6 +96,7 @@ class _CandidateOutcome:
     constraints: list[core.PairConstraint]
     flipped_constraints: list[str]
     omitted_constraints: list[str]
+    variant_label: str | None = None
     solver: StrictPairAssemblySolver | None = None
     transform: list[list[float]] | np.ndarray | None = None
     solver_used: str | None = None
@@ -145,7 +148,9 @@ def solve_jobs(
             rotation_sample_count=rotation_sample_count,
         )
         outcomes = [
-            _evaluate_candidate(
+            outcome
+            for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(job)
+            for outcome in _evaluate_candidate(
                 assembly,
                 job,
                 label,
@@ -158,8 +163,8 @@ def solve_jobs(
                 avoid_interference=avoid_interference,
                 settings=settings,
             )
-            for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(job)
         ]
+        _annotate_weak_constraint_suspicion(outcomes)
         candidate_results = [_candidate_summary(outcome) for outcome in outcomes]
         acceptable = [
             outcome
@@ -191,6 +196,7 @@ def solve_jobs(
                     collision=outcome.collision,
                     collision_adjusted=outcome.collision_adjusted,
                     selected_candidate=outcome.label,
+                    selected_variant=outcome.variant_label,
                     candidate_results=candidate_results,
                 )
             )
@@ -215,6 +221,7 @@ def solve_jobs(
                     collision=outcome.collision,
                     collision_adjusted=outcome.collision_adjusted,
                     selected_candidate=outcome.label,
+                    selected_variant=outcome.variant_label,
                     candidate_results=candidate_results,
                     error=(
                         "Solved a degraded constraint set after omitting: "
@@ -247,6 +254,7 @@ def solve_jobs(
                     collision_adjusted=outcome.collision_adjusted,
                     rejected_transform=core.matrix_to_list(outcome.transform),
                     selected_candidate=outcome.label,
+                    selected_variant=outcome.variant_label,
                     candidate_results=candidate_results,
                     error=_candidate_rejection_reason(outcome, avoid_interference=avoid_interference),
                 )
@@ -285,8 +293,8 @@ def _evaluate_candidate(
     reject_high_error: bool,
     avoid_interference: bool,
     settings: CollisionSettings,
-) -> _CandidateOutcome:
-    outcome = _CandidateOutcome(label, constraints, flipped_constraints, omitted_constraints)
+) -> list[_CandidateOutcome]:
+    error_outcome = _CandidateOutcome(label, constraints, flipped_constraints, omitted_constraints)
     try:
         solver = StrictPairAssemblySolver(
             fixed_part=job.fixed_part,
@@ -297,38 +305,67 @@ def _evaluate_candidate(
             },
             constraints=constraints,
         )
-        transform, solver_used, primary_error = _solve_with_mode(
+        transform_candidates = _solve_candidates_with_mode(
             solver,
             solver_mode,
             max_error=max_error,
             reject_high_error=reject_high_error,
         )
-        collision = None
-        collision_adjusted = None
-        if avoid_interference:
-            collision_resolution = resolve_collision(
-                solver,
-                fixed_step_path=assembly.part_paths[job.fixed_part],
-                moving_step_path=assembly.part_paths[job.moving_part],
-                transform=transform,
-                settings=settings,
-            )
-            collision = collision_resolution.analysis
-            collision_adjusted = bool(collision_resolution.adjusted)
-            transform = collision_resolution.transform
+        if not transform_candidates:
+            raise RuntimeError("No transform candidate was produced.")
 
-        diagnosis = solver.diagnose_transform(transform)
-        outcome.solver = solver
-        outcome.transform = transform
-        outcome.solver_used = solver_used
-        outcome.primary_error = primary_error
-        outcome.max_constraint_error = float(diagnosis["max_error"])
-        outcome.collision = collision
-        outcome.collision_adjusted = collision_adjusted
+        outcomes: list[_CandidateOutcome] = []
+        for transform, solver_used, primary_error, base_variant_label in transform_candidates:
+            try:
+                expanded_transforms = _expand_concentric_free_motion_candidates(
+                    solver,
+                    transform,
+                    max_error=max_error,
+                    sample_count=settings.rotation_sample_count,
+                )
+            except Exception:
+                expanded_transforms = [(transform, None)]
+
+            for expanded_transform, motion_label in expanded_transforms:
+                variant_label = base_variant_label
+                if motion_label:
+                    variant_label = f"{variant_label}:{motion_label}" if variant_label else motion_label
+                outcome = _CandidateOutcome(
+                    label,
+                    constraints,
+                    flipped_constraints,
+                    omitted_constraints,
+                    variant_label=variant_label,
+                )
+                collision = None
+                collision_adjusted = None
+                final_transform = expanded_transform
+                if avoid_interference:
+                    collision_resolution = resolve_collision(
+                        solver,
+                        fixed_step_path=assembly.part_paths[job.fixed_part],
+                        moving_step_path=assembly.part_paths[job.moving_part],
+                        transform=expanded_transform,
+                        settings=settings,
+                    )
+                    collision = collision_resolution.analysis
+                    collision_adjusted = bool(collision_resolution.adjusted)
+                    final_transform = collision_resolution.transform
+
+                diagnosis = solver.diagnose_transform(final_transform)
+                outcome.solver = solver
+                outcome.transform = final_transform
+                outcome.solver_used = solver_used
+                outcome.primary_error = primary_error
+                outcome.max_constraint_error = float(diagnosis["max_error"])
+                outcome.collision = collision
+                outcome.collision_adjusted = collision_adjusted
+                outcomes.append(outcome)
+        return outcomes
     except Exception as exc:
-        outcome.error = f"{type(exc).__name__}: {exc}"
-        outcome.traceback = traceback.format_exc()
-    return outcome
+        error_outcome.error = f"{type(exc).__name__}: {exc}"
+        error_outcome.traceback = traceback.format_exc()
+    return [error_outcome]
 
 
 def _candidate_constraint_sets(
@@ -519,6 +556,7 @@ def _candidate_summary(outcome: _CandidateOutcome) -> dict[str, Any]:
     metrics = {} if outcome.error else _candidate_final_metrics(outcome)
     summary: dict[str, Any] = {
         "label": outcome.label,
+        "variant_label": outcome.variant_label,
         "flipped_constraints": outcome.flipped_constraints,
         "status": "error" if outcome.error else "solved",
         "solver_used": outcome.solver_used,
@@ -534,6 +572,9 @@ def _candidate_summary(outcome: _CandidateOutcome) -> dict[str, Any]:
         "collision_adjusted": outcome.collision_adjusted,
         "score": None if outcome.error else list(_candidate_score(outcome)),
     }
+    suspicious = getattr(outcome, "suspicious_constraints", None)
+    if suspicious:
+        summary["suspicious_constraints"] = suspicious
     if outcome.error:
         summary["error"] = outcome.error
     if outcome.collision:
@@ -551,6 +592,210 @@ def _candidate_rejection_reason(outcome: _CandidateOutcome, *, avoid_interferenc
             f"collision status '{metrics.get('status')}'."
         )
     return f"Rejected all transform candidates; best candidate '{outcome.label}' did not satisfy tolerances."
+
+
+def _solve_candidates_with_mode(
+    solver: StrictPairAssemblySolver,
+    solver_mode: str,
+    *,
+    max_error: float,
+    reject_high_error: bool,
+) -> list[tuple[list[list[float]] | np.ndarray, str, str | None, str]]:
+    if solver_mode == "solvespace":
+        return [(solver.solve(), "solvespace", None, "solvespace")]
+
+    if solver_mode == "analytic":
+        transforms = solver._solve_analytic_candidates(max_error=max_error, max_candidates=8)
+        if not transforms:
+            return [(solver._solve_analytically(), "analytic", None, "analytic_001")]
+        return [
+            (transform, "analytic", None, f"analytic_{index:03d}")
+            for index, transform in enumerate(transforms, start=1)
+        ]
+
+    candidates: list[tuple[list[list[float]] | np.ndarray, str, str | None, str]] = []
+    primary_error: str | None = None
+    try:
+        transform = solver.solve()
+        if not reject_high_error or float(solver.diagnose_transform(transform)["max_error"]) <= float(max_error):
+            candidates.append((transform, "solvespace", None, "solvespace"))
+        else:
+            primary_error = (
+                "SolveSpace returned OK, but max_constraint_error exceeded "
+                f"threshold {float(max_error):.6g}."
+            )
+    except Exception as exc:
+        primary_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        analytic_transforms = solver._solve_analytic_candidates(max_error=max_error, max_candidates=8)
+        for index, transform in enumerate(analytic_transforms, start=1):
+            candidates.append((transform, "analytic", primary_error, f"analytic_{index:03d}"))
+    except Exception:
+        if not candidates:
+            raise
+
+    return _dedupe_transform_candidates(candidates)
+
+
+def _dedupe_transform_candidates(
+    candidates: list[tuple[list[list[float]] | np.ndarray, str, str | None, str]]
+) -> list[tuple[list[list[float]] | np.ndarray, str, str | None, str]]:
+    deduped = []
+    seen: set[tuple[float, ...]] = set()
+    for transform, solver_used, primary_error, label in candidates:
+        matrix = np.asarray(transform, dtype=float)
+        key = tuple(round(float(value), 8) for value in matrix.reshape(-1))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((transform, solver_used, primary_error, label))
+    return deduped
+
+
+def _expand_concentric_free_motion_candidates(
+    solver: StrictPairAssemblySolver,
+    transform: list[list[float]] | np.ndarray,
+    *,
+    max_error: float,
+    sample_count: int,
+) -> list[tuple[np.ndarray, str | None]]:
+    axis_info = _first_concentric_axis(solver)
+    if axis_info is None:
+        return [(np.asarray(transform, dtype=float), None)]
+
+    axis_point, axis_direction, scale = axis_info
+    angle_count = min(max(int(sample_count or 0), 2), 6)
+    angles = [0.0] + [360.0 * index / float(angle_count) for index in range(1, angle_count)]
+    shift_scale = max(float(scale), 1.0)
+    shifts = [
+        0.0,
+        -0.15 * shift_scale,
+        0.15 * shift_scale,
+    ]
+
+    base_transform = np.asarray(transform, dtype=float)
+    candidates: list[tuple[np.ndarray, str | None]] = []
+    seen: set[tuple[float, ...]] = set()
+    for angle in angles:
+        rotation_delta = _axis_rotation_transform(axis_point, axis_direction, angle)
+        for shift in shifts:
+            translation_delta = np.eye(4, dtype=float)
+            translation_delta[:3, 3] = np.asarray(axis_direction, dtype=float) * float(shift)
+            candidate = translation_delta @ rotation_delta @ base_transform
+            diagnosis = solver.diagnose_transform(candidate)
+            if float(diagnosis["max_error"]) > max(float(max_error), float(max_error) * 10.0):
+                continue
+            key = tuple(round(float(value), 8) for value in candidate.reshape(-1))
+            if key in seen:
+                continue
+            seen.add(key)
+            label = None if abs(angle) < 1e-12 and abs(shift) < 1e-12 else f"free_a{angle:.1f}_s{shift:.4g}"
+            candidates.append((candidate, label))
+            if len(candidates) >= 18:
+                return candidates
+    return candidates or [(base_transform, None)]
+
+
+def _first_concentric_axis(solver: StrictPairAssemblySolver) -> tuple[np.ndarray, np.ndarray, float] | None:
+    points: list[np.ndarray] = []
+    radii: list[float] = []
+    for constraint in solver.constraints:
+        if constraint.kind not in {"concentric", "coincident"}:
+            continue
+        try:
+            moving_ref, fixed_ref = solver._split_constraint(constraint)
+            moving_feature = solver._feature_for(moving_ref)
+            fixed_feature = solver._feature_for(fixed_ref)
+        except Exception:
+            continue
+        if isinstance(moving_feature, core.CylinderFeature) and isinstance(fixed_feature, core.CylinderFeature):
+            points.extend(
+                [
+                    np.asarray(moving_feature.axis_point, dtype=float),
+                    np.asarray(fixed_feature.axis_point, dtype=float),
+                    np.asarray(moving_feature.surface_point, dtype=float),
+                    np.asarray(fixed_feature.surface_point, dtype=float),
+                ]
+            )
+            radii.extend([abs(float(moving_feature.radius)), abs(float(fixed_feature.radius))])
+            scale = max(
+                max(radii, default=1.0) * 20.0,
+                _point_cloud_scale(points),
+                1.0,
+            )
+            return (
+                np.asarray(fixed_feature.axis_point, dtype=float),
+                core.normalize(fixed_feature.axis),
+                float(scale),
+            )
+    return None
+
+
+def _point_cloud_scale(points: list[np.ndarray]) -> float:
+    if len(points) < 2:
+        return 1.0
+    array = np.asarray(points, dtype=float)
+    span = np.max(array, axis=0) - np.min(array, axis=0)
+    return float(np.linalg.norm(span))
+
+
+def _axis_rotation_transform(axis_point: np.ndarray, axis_direction: np.ndarray, angle_deg: float) -> np.ndarray:
+    axis = core.normalize(axis_direction)
+    point = np.asarray(axis_point, dtype=float)
+    angle = math.radians(float(angle_deg))
+    x_value, y_value, z_value = axis
+    cos_value = math.cos(angle)
+    sin_value = math.sin(angle)
+    one_minus_cos = 1.0 - cos_value
+    rotation = np.asarray(
+        [
+            [
+                cos_value + x_value * x_value * one_minus_cos,
+                x_value * y_value * one_minus_cos - z_value * sin_value,
+                x_value * z_value * one_minus_cos + y_value * sin_value,
+            ],
+            [
+                y_value * x_value * one_minus_cos + z_value * sin_value,
+                cos_value + y_value * y_value * one_minus_cos,
+                y_value * z_value * one_minus_cos - x_value * sin_value,
+            ],
+            [
+                z_value * x_value * one_minus_cos - y_value * sin_value,
+                z_value * y_value * one_minus_cos + x_value * sin_value,
+                cos_value + z_value * z_value * one_minus_cos,
+            ],
+        ],
+        dtype=float,
+    )
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = point - rotation @ point
+    return transform
+
+
+def _annotate_weak_constraint_suspicion(outcomes: list[_CandidateOutcome]) -> None:
+    complete_collision = [
+        outcome
+        for outcome in outcomes
+        if outcome.has_transform
+        and not outcome.omitted_constraints
+        and _candidate_final_metrics(outcome).get("status") not in {"clearance", "contact"}
+    ]
+    if not complete_collision:
+        return
+    recovered_omissions: set[str] = set()
+    for outcome in outcomes:
+        if not outcome.has_transform or not outcome.omitted_constraints:
+            continue
+        metrics = _candidate_final_metrics(outcome)
+        if metrics.get("status") in {"clearance", "contact"}:
+            recovered_omissions.update(outcome.omitted_constraints)
+    if not recovered_omissions:
+        return
+    for outcome in outcomes:
+        if outcome.has_transform:
+            outcome.suspicious_constraints = sorted(recovered_omissions)
 
 
 def _solve_with_mode(

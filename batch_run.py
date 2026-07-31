@@ -468,6 +468,12 @@ def _record_json(
         "transform_matrix": matrix,
         "matrix_source": matrix_source,
         "max_constraint_error": record.max_constraint_error,
+        "selected_candidate": record.selected_candidate,
+        "selected_variant": getattr(record, "selected_variant", None),
+        "primary_error": record.primary_error,
+        "collision": record.collision,
+        "collision_adjusted": record.collision_adjusted,
+        "candidate_results": record.candidate_results,
         "step": step_path,
         "error": record.error,
     }

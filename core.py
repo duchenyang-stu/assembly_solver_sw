@@ -28,7 +28,7 @@ def _require_occ():
         from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
         from OCC.Core.BRepGProp import brepgprop_SurfaceProperties
         from OCC.Core.GProp import GProp_GProps
-        from OCC.Core.GeomAbs import GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane
+        from OCC.Core.GeomAbs import GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Sphere, GeomAbs_Torus
         from OCC.Core.IFSelect import IFSelect_RetDone
         from OCC.Core.STEPControl import STEPControl_Reader
         from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED
@@ -46,6 +46,8 @@ def _require_occ():
         "GProp_GProps": GProp_GProps,
         "GeomAbs_Cylinder": GeomAbs_Cylinder,
         "GeomAbs_Plane": GeomAbs_Plane,
+        "GeomAbs_Sphere": GeomAbs_Sphere,
+        "GeomAbs_Torus": GeomAbs_Torus,
         "IFSelect_RetDone": IFSelect_RetDone,
         "STEPControl_Reader": STEPControl_Reader,
         "TopAbs_FACE": TopAbs_FACE,
@@ -284,7 +286,23 @@ class CylinderFeature:
     surface_point: np.ndarray
 
 
-Feature = Union[PlaneFeature, CylinderFeature]
+@dataclass(frozen=True)
+class SphereFeature:
+    center: np.ndarray
+    radius: float
+    surface_point: np.ndarray
+
+
+@dataclass(frozen=True)
+class TorusFeature:
+    center: np.ndarray
+    axis: np.ndarray
+    major_radius: float
+    minor_radius: float
+    surface_point: np.ndarray
+
+
+Feature = Union[PlaneFeature, CylinderFeature, SphereFeature, TorusFeature]
 
 
 @dataclass(frozen=True)
@@ -381,6 +399,10 @@ class StepFeatureExtractor:
             raise TypeError(
                 f"Face {face_index} in '{step_path}' is not a cylinder-like axial surface."
             )
+        if expected == "sphere" and surface_type != self.occ["GeomAbs_Sphere"]:
+            raise TypeError(f"Face {face_index} in '{step_path}' is not a sphere.")
+        if expected == "torus" and surface_type != self.occ["GeomAbs_Torus"]:
+            raise TypeError(f"Face {face_index} in '{step_path}' is not a torus.")
 
         props = self.occ["GProp_GProps"]()
         self.occ["brepgprop_SurfaceProperties"](face, props)
@@ -418,9 +440,36 @@ class StepFeatureExtractor:
                 surface_point=face_center,
             )
 
+        if surface_type == self.occ["GeomAbs_Sphere"]:
+            sphere = adaptor.Sphere()
+            location = sphere.Location()
+            center_point = np.array([float(location.X()), float(location.Y()), float(location.Z())], dtype=float)
+            return SphereFeature(
+                center=center_point,
+                radius=float(sphere.Radius()),
+                surface_point=face_center,
+            )
+
+        if surface_type == self.occ["GeomAbs_Torus"]:
+            torus = adaptor.Torus()
+            axis = torus.Axis()
+            direction = axis.Direction()
+            location = axis.Location()
+            center_point = np.array([float(location.X()), float(location.Y()), float(location.Z())], dtype=float)
+            axis_dir = normalize([direction.X(), direction.Y(), direction.Z()])
+            if face.Orientation() == self.occ["TopAbs_REVERSED"]:
+                axis_dir = -axis_dir
+            return TorusFeature(
+                center=center_point,
+                axis=axis_dir,
+                major_radius=float(torus.MajorRadius()),
+                minor_radius=float(torus.MinorRadius()),
+                surface_point=face_center,
+            )
+
         raise TypeError(
             f"Face {face_index} in '{step_path}' has unsupported type '{surface_type}'. "
-            "Only Plane and cylinder-like axial surfaces are supported."
+            "Only Plane, cylinder-like axial, Sphere, and Torus surfaces are supported."
         )
 
 
@@ -980,12 +1029,11 @@ class PairAssemblySolver:
     @staticmethod
     def _tangent_signed_distances(radius: float, orientation: int) -> List[float]:
         radius = abs(float(radius))
-        if int(orientation) == 1:
-            return [radius]
-        if int(orientation) == 2:
-            return [-radius]
         if radius < 1e-9:
             return [0.0]
+        # Keep both contact sides as transform candidates. The source
+        # orientation is still explored by outer flipped-orientation candidates,
+        # but collision scoring needs to see both residual-equivalent sides.
         return [radius, -radius]
 
     @staticmethod
@@ -1009,6 +1057,37 @@ class PairAssemblySolver:
         if np.linalg.norm(perpendicular) < 1e-8:
             perpendicular = arbitrary_perpendicular(axis_vec)
         return normalize(perpendicular)
+
+    @staticmethod
+    def _point_line_offset_direction(
+        point: Sequence[float],
+        axis_point: Sequence[float],
+        axis: Sequence[float],
+    ) -> np.ndarray:
+        axis_vec = normalize(axis)
+        delta = np.asarray(point, dtype=float) - np.asarray(axis_point, dtype=float)
+        perpendicular = delta - float(np.dot(delta, axis_vec)) * axis_vec
+        if np.linalg.norm(perpendicular) < 1e-8:
+            perpendicular = arbitrary_perpendicular(axis_vec)
+        return normalize(perpendicular)
+
+    @staticmethod
+    def _point_line_distance(
+        point: Sequence[float],
+        axis_point: Sequence[float],
+        axis: Sequence[float],
+    ) -> float:
+        axis_vec = normalize(axis)
+        delta = np.asarray(point, dtype=float) - np.asarray(axis_point, dtype=float)
+        return float(np.linalg.norm(delta - float(np.dot(delta, axis_vec)) * axis_vec))
+
+    @staticmethod
+    def _sphere_tangent_distances(radius_a: float, radius_b: float) -> List[float]:
+        outer = abs(float(radius_a)) + abs(float(radius_b))
+        inner = abs(abs(float(radius_a)) - abs(float(radius_b)))
+        if inner < 1e-9 or abs(outer - inner) < 1e-9:
+            return [outer]
+        return [outer, inner]
 
     @staticmethod
     def _rotation_from_direction_pairs(direction_pairs: Sequence[Tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
@@ -1053,8 +1132,13 @@ class PairAssemblySolver:
                     continue
 
                 if constraint.kind == "parallel":
-                    dot_value = float(np.dot(moving_feature.normal, fixed_feature.normal))
-                    normal_sign = 1.0 if dot_value >= 0.0 else -1.0
+                    if int(constraint.orientation) == 1:
+                        normal_sign = 1.0
+                    elif int(constraint.orientation) == 2:
+                        normal_sign = -1.0
+                    else:
+                        dot_value = float(np.dot(moving_feature.normal, fixed_feature.normal))
+                        normal_sign = 1.0 if dot_value >= 0.0 else -1.0
                     direction_pairs.append((moving_feature.normal, normal_sign * fixed_feature.normal))
                     continue
 
@@ -1100,6 +1184,56 @@ class PairAssemblySolver:
                     direction_pairs.append((moving_feature.normal, target_normal))
                     continue
 
+            if isinstance(moving_feature, SphereFeature) or isinstance(fixed_feature, SphereFeature):
+                if constraint.kind in {"coincident", "concentric", "tangent"}:
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, CylinderFeature):
+                if constraint.kind in {"coincident", "concentric"}:
+                    if int(constraint.orientation) == 1:
+                        axis_sign = 1.0
+                    elif int(constraint.orientation) == 2:
+                        axis_sign = -1.0
+                    else:
+                        axis_sign = 1.0 if float(np.dot(moving_feature.axis, fixed_feature.axis)) >= 0.0 else -1.0
+                    direction_pairs.append((moving_feature.axis, axis_sign * fixed_feature.axis))
+                    continue
+                if constraint.kind == "tangent":
+                    continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, TorusFeature):
+                if constraint.kind in {"coincident", "concentric"}:
+                    if int(constraint.orientation) == 1:
+                        axis_sign = 1.0
+                    elif int(constraint.orientation) == 2:
+                        axis_sign = -1.0
+                    else:
+                        axis_sign = 1.0 if float(np.dot(moving_feature.axis, fixed_feature.axis)) >= 0.0 else -1.0
+                    direction_pairs.append((moving_feature.axis, axis_sign * fixed_feature.axis))
+                    continue
+                if constraint.kind == "tangent":
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, TorusFeature):
+                if constraint.kind in {"coincident", "concentric"}:
+                    if int(constraint.orientation) == 1:
+                        axis_sign = 1.0
+                    elif int(constraint.orientation) == 2:
+                        axis_sign = -1.0
+                    else:
+                        axis_sign = 1.0 if float(np.dot(moving_feature.axis, fixed_feature.axis)) >= 0.0 else -1.0
+                    direction_pairs.append((moving_feature.axis, axis_sign * fixed_feature.axis))
+                    continue
+                if constraint.kind == "tangent":
+                    continue
+
+            if (
+                (isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, PlaneFeature))
+                or (isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, TorusFeature))
+            ):
+                if constraint.kind == "tangent":
+                    continue
+
             raise NotImplementedError(
                 f"{constraint.name}: analytic fallback does not support "
                 f"{type(moving_feature).__name__} <-> {type(fixed_feature).__name__}."
@@ -1114,7 +1248,7 @@ class PairAssemblySolver:
 
         base_rows: List[np.ndarray] = []
         base_values: List[float] = []
-        distance_options: List[List[Tuple[str, np.ndarray, float]]] = []
+        distance_options: List[List[List[Tuple[str, np.ndarray, float]]]] = []
 
         for constraint in self.constraints:
             moving_ref, fixed_ref = self._split_constraint(constraint)
@@ -1150,7 +1284,7 @@ class PairAssemblySolver:
                             - np.dot(normal, moved_point_without_translation)
                         )
                         options.append((constraint.name, normal, rhs))
-                    distance_options.append(options)
+                    distance_options.append([[option] for option in options])
                     continue
 
                 continue
@@ -1197,7 +1331,7 @@ class PairAssemblySolver:
                             - np.dot(normal, moved_axis_point)
                         )
                         options.append((constraint.name, normal, rhs))
-                    distance_options.append(options)
+                    distance_options.append([[option] for option in options])
                     continue
 
             if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, CylinderFeature):
@@ -1214,7 +1348,208 @@ class PairAssemblySolver:
                             - signed_distance
                         )
                         options.append((constraint.name, moved_normal, rhs))
-                    distance_options.append(options)
+                    distance_options.append([[option] for option in options])
+                    continue
+
+            if isinstance(moving_feature, SphereFeature) and isinstance(fixed_feature, SphereFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center)
+                if constraint.kind in {"coincident", "concentric"}:
+                    delta = fixed_feature.center - moved_center
+                    for basis_vector in np.eye(3):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+                if constraint.kind == "tangent":
+                    direction = moved_center - fixed_feature.center
+                    if np.linalg.norm(direction) < 1e-8:
+                        direction = arbitrary_perpendicular(np.array([0.0, 0.0, 1.0], dtype=float))
+                    direction = normalize(direction)
+                    option_groups: List[List[Tuple[str, np.ndarray, float]]] = []
+                    for distance in self._sphere_tangent_distances(moving_feature.radius, fixed_feature.radius):
+                        target_center = fixed_feature.center + float(distance) * direction
+                        group: List[Tuple[str, np.ndarray, float]] = []
+                        for basis_vector in np.eye(3):
+                            group.append(
+                                (
+                                    constraint.name,
+                                    np.asarray(basis_vector, dtype=float),
+                                    float(np.dot(basis_vector, target_center - moved_center)),
+                                )
+                            )
+                        option_groups.append(group)
+                    distance_options.append(option_groups)
+                    continue
+
+            if isinstance(moving_feature, SphereFeature) and isinstance(fixed_feature, PlaneFeature):
+                if constraint.kind == "tangent":
+                    normal = normalize(fixed_feature.normal)
+                    moved_center = self._mat3_vec_mul(rotation, moving_feature.center)
+                    options: List[Tuple[str, np.ndarray, float]] = []
+                    for signed_distance in self._tangent_signed_distances(
+                        moving_feature.radius,
+                        constraint.orientation,
+                    ):
+                        rhs = float(
+                            signed_distance
+                            + np.dot(normal, fixed_feature.point)
+                            - np.dot(normal, moved_center)
+                        )
+                        options.append((constraint.name, normal, rhs))
+                    distance_options.append([[option] for option in options])
+                    continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, SphereFeature):
+                if constraint.kind == "tangent":
+                    moved_plane_point = self._mat3_vec_mul(rotation, moving_feature.point)
+                    moved_normal = normalize(self._mat3_vec_mul(rotation, moving_feature.normal))
+                    options: List[Tuple[str, np.ndarray, float]] = []
+                    for signed_distance in self._tangent_signed_distances(
+                        fixed_feature.radius,
+                        constraint.orientation,
+                    ):
+                        rhs = float(
+                            np.dot(moved_normal, fixed_feature.center - moved_plane_point)
+                            - signed_distance
+                        )
+                        options.append((constraint.name, moved_normal, rhs))
+                    distance_options.append([[option] for option in options])
+                    continue
+
+            if isinstance(moving_feature, SphereFeature) and isinstance(fixed_feature, CylinderFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center)
+                axis = normalize(fixed_feature.axis)
+                if constraint.kind in {"coincident", "concentric"}:
+                    delta = fixed_feature.axis_point - moved_center
+                    basis_a = arbitrary_perpendicular(axis)
+                    basis_b = normalize(np.cross(axis, basis_a))
+                    for basis_vector in (basis_a, basis_b):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+                if constraint.kind == "tangent":
+                    offset_direction = self._point_line_offset_direction(
+                        moved_center,
+                        fixed_feature.axis_point,
+                        axis,
+                    )
+                    basis_a = arbitrary_perpendicular(axis)
+                    basis_b = normalize(np.cross(axis, basis_a))
+                    option_groups: List[List[Tuple[str, np.ndarray, float]]] = []
+                    for distance in self._sphere_tangent_distances(moving_feature.radius, fixed_feature.radius):
+                        target_center = fixed_feature.axis_point + float(distance) * offset_direction
+                        group: List[Tuple[str, np.ndarray, float]] = []
+                        for basis_vector in (basis_a, basis_b):
+                            group.append(
+                                (
+                                    constraint.name,
+                                    np.asarray(basis_vector, dtype=float),
+                                    float(np.dot(basis_vector, target_center - moved_center)),
+                                )
+                            )
+                        option_groups.append(group)
+                    distance_options.append(option_groups)
+                    continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, SphereFeature):
+                moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point)
+                moved_axis = normalize(self._mat3_vec_mul(rotation, moving_feature.axis))
+                if constraint.kind in {"coincident", "concentric"}:
+                    delta = fixed_feature.center - moved_axis_point
+                    basis_a = arbitrary_perpendicular(moved_axis)
+                    basis_b = normalize(np.cross(moved_axis, basis_a))
+                    for basis_vector in (basis_a, basis_b):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+                if constraint.kind == "tangent":
+                    offset_direction = self._point_line_offset_direction(
+                        fixed_feature.center,
+                        moved_axis_point,
+                        moved_axis,
+                    )
+                    basis_a = arbitrary_perpendicular(moved_axis)
+                    basis_b = normalize(np.cross(moved_axis, basis_a))
+                    option_groups: List[List[Tuple[str, np.ndarray, float]]] = []
+                    for distance in self._sphere_tangent_distances(moving_feature.radius, fixed_feature.radius):
+                        target_axis_point = fixed_feature.center - float(distance) * offset_direction
+                        group: List[Tuple[str, np.ndarray, float]] = []
+                        for basis_vector in (basis_a, basis_b):
+                            group.append(
+                                (
+                                    constraint.name,
+                                    np.asarray(basis_vector, dtype=float),
+                                    float(np.dot(basis_vector, target_axis_point - moved_axis_point)),
+                                )
+                            )
+                        option_groups.append(group)
+                    distance_options.append(option_groups)
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, CylinderFeature):
+                if constraint.kind in {"coincident", "concentric"}:
+                    axis = normalize(fixed_feature.axis)
+                    moved_center = self._mat3_vec_mul(rotation, moving_feature.center)
+                    delta = fixed_feature.axis_point - moved_center
+                    basis_a = arbitrary_perpendicular(axis)
+                    basis_b = normalize(np.cross(axis, basis_a))
+                    for basis_vector in (basis_a, basis_b):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, TorusFeature):
+                if constraint.kind in {"coincident", "concentric"}:
+                    moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point)
+                    axis = normalize(fixed_feature.axis)
+                    delta = fixed_feature.center - moved_axis_point
+                    basis_a = arbitrary_perpendicular(axis)
+                    basis_b = normalize(np.cross(axis, basis_a))
+                    for basis_vector in (basis_a, basis_b):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, TorusFeature):
+                if constraint.kind in {"coincident", "concentric"}:
+                    moved_center = self._mat3_vec_mul(rotation, moving_feature.center)
+                    delta = fixed_feature.center - moved_center
+                    for basis_vector in np.eye(3):
+                        base_rows.append(np.asarray(basis_vector, dtype=float))
+                        base_values.append(float(np.dot(basis_vector, delta)))
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, PlaneFeature):
+                if constraint.kind == "tangent":
+                    normal = normalize(fixed_feature.normal)
+                    moved_center = self._mat3_vec_mul(rotation, moving_feature.center)
+                    extent = abs(float(moving_feature.major_radius)) + abs(float(moving_feature.minor_radius))
+                    options: List[Tuple[str, np.ndarray, float]] = []
+                    for signed_distance in self._tangent_signed_distances(extent, constraint.orientation):
+                        rhs = float(
+                            signed_distance
+                            + np.dot(normal, fixed_feature.point)
+                            - np.dot(normal, moved_center)
+                        )
+                        options.append((constraint.name, normal, rhs))
+                    distance_options.append([[option] for option in options])
+                    continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, TorusFeature):
+                if constraint.kind == "tangent":
+                    moved_plane_point = self._mat3_vec_mul(rotation, moving_feature.point)
+                    moved_normal = normalize(self._mat3_vec_mul(rotation, moving_feature.normal))
+                    extent = abs(float(fixed_feature.major_radius)) + abs(float(fixed_feature.minor_radius))
+                    options: List[Tuple[str, np.ndarray, float]] = []
+                    for signed_distance in self._tangent_signed_distances(extent, constraint.orientation):
+                        rhs = float(
+                            np.dot(moved_normal, fixed_feature.center - moved_plane_point)
+                            - signed_distance
+                        )
+                        options.append((constraint.name, moved_normal, rhs))
+                    distance_options.append([[option] for option in options])
                     continue
 
         option_products = itertools.product(*distance_options) if distance_options else [()]
@@ -1224,10 +1559,11 @@ class PairAssemblySolver:
             rows = list(base_rows)
             values = list(base_values)
             signs: List[Tuple[str, float]] = []
-            for name, row, rhs in option_product:
-                rows.append(np.asarray(row, dtype=float))
-                values.append(float(rhs))
-                signs.append((name, float(rhs)))
+            for option_group in option_product:
+                for name, row, rhs in option_group:
+                    rows.append(np.asarray(row, dtype=float))
+                    values.append(float(rhs))
+                    signs.append((name, float(rhs)))
 
             if not rows:
                 candidates.append((np.zeros(3, dtype=float), signs))
@@ -1281,6 +1617,15 @@ class PairAssemblySolver:
 
                 if constraint.kind == "parallel":
                     errors.append((constraint.name, "plane_parallel", abs(1.0 - abs(float(np.dot(moved_normal, fixed_normal))))))
+                    if int(constraint.orientation) in {1, 2}:
+                        target_normal = -fixed_normal if int(constraint.orientation) == 2 else fixed_normal
+                        errors.append(
+                            (
+                                constraint.name,
+                                "plane_parallel_orientation",
+                                float(np.linalg.norm(moved_normal - target_normal)),
+                            )
+                        )
                     continue
 
                 if constraint.kind == "angle":
@@ -1332,6 +1677,126 @@ class PairAssemblySolver:
                     )
                 )
                 continue
+
+            if isinstance(moving_feature, SphereFeature) and isinstance(fixed_feature, SphereFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center) + translation
+                center_distance = float(np.linalg.norm(moved_center - fixed_feature.center))
+                if constraint.kind in {"coincident", "concentric"}:
+                    errors.append((constraint.name, "sphere_center_distance", center_distance))
+                    continue
+                if constraint.kind == "tangent":
+                    target_error = min(
+                        abs(center_distance - target_distance)
+                        for target_distance in self._sphere_tangent_distances(moving_feature.radius, fixed_feature.radius)
+                    )
+                    errors.append((constraint.name, "sphere_tangent_distance", float(target_error)))
+                    continue
+
+            if isinstance(moving_feature, SphereFeature) and isinstance(fixed_feature, PlaneFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center) + translation
+                fixed_normal = normalize(fixed_feature.normal)
+                signed_offset = float(np.dot(fixed_normal, moved_center - fixed_feature.point))
+                if constraint.kind == "tangent":
+                    errors.append(
+                        (
+                            constraint.name,
+                            "sphere_plane_tangent_distance",
+                            abs(abs(signed_offset) - abs(float(moving_feature.radius))),
+                        )
+                    )
+                    continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, SphereFeature):
+                moved_plane_point = self._mat3_vec_mul(rotation, moving_feature.point) + translation
+                moved_normal = normalize(self._mat3_vec_mul(rotation, moving_feature.normal))
+                signed_offset = float(np.dot(moved_normal, fixed_feature.center - moved_plane_point))
+                if constraint.kind == "tangent":
+                    errors.append(
+                        (
+                            constraint.name,
+                            "sphere_plane_tangent_distance",
+                            abs(abs(signed_offset) - abs(float(fixed_feature.radius))),
+                        )
+                    )
+                    continue
+
+            if isinstance(moving_feature, SphereFeature) and isinstance(fixed_feature, CylinderFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center) + translation
+                distance = self._point_line_distance(moved_center, fixed_feature.axis_point, fixed_feature.axis)
+                if constraint.kind in {"coincident", "concentric"}:
+                    errors.append((constraint.name, "sphere_center_axis_distance", distance))
+                    continue
+                if constraint.kind == "tangent":
+                    target_error = min(
+                        abs(distance - target_distance)
+                        for target_distance in self._sphere_tangent_distances(moving_feature.radius, fixed_feature.radius)
+                    )
+                    errors.append((constraint.name, "sphere_cylinder_tangent_distance", float(target_error)))
+                    continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, SphereFeature):
+                moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point) + translation
+                moved_axis = normalize(self._mat3_vec_mul(rotation, moving_feature.axis))
+                distance = self._point_line_distance(fixed_feature.center, moved_axis_point, moved_axis)
+                if constraint.kind in {"coincident", "concentric"}:
+                    errors.append((constraint.name, "sphere_center_axis_distance", distance))
+                    continue
+                if constraint.kind == "tangent":
+                    target_error = min(
+                        abs(distance - target_distance)
+                        for target_distance in self._sphere_tangent_distances(moving_feature.radius, fixed_feature.radius)
+                    )
+                    errors.append((constraint.name, "sphere_cylinder_tangent_distance", float(target_error)))
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, CylinderFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center) + translation
+                moved_axis = normalize(self._mat3_vec_mul(rotation, moving_feature.axis))
+                fixed_axis = normalize(fixed_feature.axis)
+                if constraint.kind in {"coincident", "concentric"}:
+                    axis_parallel_error = abs(1.0 - abs(float(np.dot(moved_axis, fixed_axis))))
+                    axis_separation = self._point_line_distance(moved_center, fixed_feature.axis_point, fixed_axis)
+                    errors.append((constraint.name, "axis_parallel", axis_parallel_error))
+                    errors.append((constraint.name, "axis_separation", axis_separation))
+                    continue
+
+            if isinstance(moving_feature, CylinderFeature) and isinstance(fixed_feature, TorusFeature):
+                moved_axis_point = self._mat3_vec_mul(rotation, moving_feature.axis_point) + translation
+                moved_axis = normalize(self._mat3_vec_mul(rotation, moving_feature.axis))
+                fixed_axis = normalize(fixed_feature.axis)
+                if constraint.kind in {"coincident", "concentric"}:
+                    axis_parallel_error = abs(1.0 - abs(float(np.dot(moved_axis, fixed_axis))))
+                    axis_separation = self._point_line_distance(moved_axis_point, fixed_feature.center, fixed_axis)
+                    errors.append((constraint.name, "axis_parallel", axis_parallel_error))
+                    errors.append((constraint.name, "axis_separation", axis_separation))
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, TorusFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center) + translation
+                moved_axis = normalize(self._mat3_vec_mul(rotation, moving_feature.axis))
+                fixed_axis = normalize(fixed_feature.axis)
+                if constraint.kind in {"coincident", "concentric"}:
+                    errors.append((constraint.name, "torus_center_distance", float(np.linalg.norm(moved_center - fixed_feature.center))))
+                    errors.append((constraint.name, "axis_parallel", abs(1.0 - abs(float(np.dot(moved_axis, fixed_axis))))))
+                    continue
+
+            if isinstance(moving_feature, TorusFeature) and isinstance(fixed_feature, PlaneFeature):
+                moved_center = self._mat3_vec_mul(rotation, moving_feature.center) + translation
+                fixed_normal = normalize(fixed_feature.normal)
+                signed_offset = float(np.dot(fixed_normal, moved_center - fixed_feature.point))
+                if constraint.kind == "tangent":
+                    extent = abs(float(moving_feature.major_radius)) + abs(float(moving_feature.minor_radius))
+                    errors.append((constraint.name, "torus_plane_side_contact_distance", abs(abs(signed_offset) - extent)))
+                    continue
+
+            if isinstance(moving_feature, PlaneFeature) and isinstance(fixed_feature, TorusFeature):
+                moved_plane_point = self._mat3_vec_mul(rotation, moving_feature.point) + translation
+                moved_normal = normalize(self._mat3_vec_mul(rotation, moving_feature.normal))
+                signed_offset = float(np.dot(moved_normal, fixed_feature.center - moved_plane_point))
+                if constraint.kind == "tangent":
+                    extent = abs(float(fixed_feature.major_radius)) + abs(float(fixed_feature.minor_radius))
+                    errors.append((constraint.name, "torus_plane_side_contact_distance", abs(abs(signed_offset) - extent)))
+                    continue
 
         return errors
 
@@ -1387,29 +1852,52 @@ class PairAssemblySolver:
         }
 
     def _solve_analytically(self) -> List[List[float]]:
-        rotation = self._rotation_from_direction_pairs(self._analytic_direction_pairs())
-        best_transform: Optional[List[List[float]]] = None
-        best_error = math.inf
-        best_errors: List[Tuple[str, str, float]] = []
+        candidates = self._solve_analytic_candidates(max_error=1e-4)
+        if candidates:
+            return candidates[0]
 
+        rotation = self._rotation_from_direction_pairs(self._analytic_direction_pairs())
+        best_errors: List[Tuple[str, str, float]] = []
+        best_error = math.inf
         for translation, _ in self._analytic_translation_candidates(rotation):
             errors = self._analytic_constraint_errors(rotation, translation)
             max_error = max((error for _, _, error in errors), default=0.0)
             if max_error < best_error:
                 best_error = max_error
                 best_errors = errors
-                best_transform = [
-                    [float(rotation[0, 0]), float(rotation[0, 1]), float(rotation[0, 2]), float(translation[0])],
-                    [float(rotation[1, 0]), float(rotation[1, 1]), float(rotation[1, 2]), float(translation[1])],
-                    [float(rotation[2, 0]), float(rotation[2, 1]), float(rotation[2, 2]), float(translation[2])],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]
-
-        if best_transform is not None and best_error <= 1e-4:
-            return best_transform
 
         detail = "; ".join(f"{name}:{kind}={value:.6g}" for name, kind, value in best_errors)
         raise RuntimeError(f"Analytic fallback could not satisfy the selected constraints. {detail}")
+
+    def _solve_analytic_candidates(
+        self,
+        *,
+        max_error: float = 1e-4,
+        max_candidates: int = 64,
+    ) -> List[List[List[float]]]:
+        rotation = self._rotation_from_direction_pairs(self._analytic_direction_pairs())
+        candidates: List[Tuple[float, List[List[float]]]] = []
+        seen: set[Tuple[float, ...]] = set()
+
+        for translation, _ in self._analytic_translation_candidates(rotation):
+            errors = self._analytic_constraint_errors(rotation, translation)
+            candidate_error = max((error for _, _, error in errors), default=0.0)
+            if candidate_error > float(max_error):
+                continue
+            transform = [
+                [float(rotation[0, 0]), float(rotation[0, 1]), float(rotation[0, 2]), float(translation[0])],
+                [float(rotation[1, 0]), float(rotation[1, 1]), float(rotation[1, 2]), float(translation[1])],
+                [float(rotation[2, 0]), float(rotation[2, 1]), float(rotation[2, 2]), float(translation[2])],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+            key = tuple(round(value, 9) for row in transform for value in row)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((float(candidate_error), transform))
+
+        candidates.sort(key=lambda item: item[0])
+        return [transform for _, transform in candidates[: max(1, int(max_candidates))]]
 
     def _apply_plane_plane_distance(self, system, moving: PlaneEntities, fixed: PlaneEntities, value: float) -> None:
         if fixed.workplane is None:
