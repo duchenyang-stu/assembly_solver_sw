@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover - direct script execution fallback
     import core
 
-from .collision import CollisionSettings, resolve_collision
+from .collision import CollisionSettings, PairGeometry, load_pair_geometry, resolve_collision
 from .input_loader import AssemblyInput, PairJob
 
 
@@ -43,9 +43,14 @@ class SolveRecord:
     candidate_results: list[dict[str, Any]] | None = None
     error: str | None = None
     traceback: str | None = None
+    geometry: PairGeometry | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {key: value for key, value in self.__dict__.items() if value is not None}
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key != "geometry" and value is not None
+        }
 
 
 class StrictPairAssemblySolver(core.PairAssemblySolver):
@@ -150,6 +155,15 @@ def solve_jobs(
             search_free_rotation=search_free_rotation,
             rotation_sample_count=rotation_sample_count,
         )
+        feature_extractor = core.StepFeatureExtractor()
+        geometry = (
+            load_pair_geometry(
+                assembly.part_paths[job.fixed_part],
+                assembly.part_paths[job.moving_part],
+            )
+            if avoid_interference
+            else None
+        )
         outcomes = [
             outcome
             for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(
@@ -170,6 +184,8 @@ def solve_jobs(
                 reject_high_error=reject_high_error,
                 avoid_interference=avoid_interference,
                 settings=settings,
+                feature_extractor=feature_extractor,
+                geometry=geometry,
             )
         ]
         _annotate_weak_constraint_suspicion(outcomes)
@@ -206,6 +222,7 @@ def solve_jobs(
                     selected_candidate=outcome.label,
                     selected_variant=outcome.variant_label,
                     candidate_results=candidate_results,
+                    geometry=geometry,
                 )
             )
             continue
@@ -231,6 +248,7 @@ def solve_jobs(
                     selected_candidate=outcome.label,
                     selected_variant=outcome.variant_label,
                     candidate_results=candidate_results,
+                    geometry=geometry,
                     error=(
                         "Solved a degraded constraint set after omitting: "
                         + ", ".join(outcome.omitted_constraints)
@@ -264,6 +282,7 @@ def solve_jobs(
                     selected_candidate=outcome.label,
                     selected_variant=outcome.variant_label,
                     candidate_results=candidate_results,
+                    geometry=geometry,
                     error=_candidate_rejection_reason(outcome, avoid_interference=avoid_interference),
                 )
             )
@@ -301,6 +320,8 @@ def _evaluate_candidate(
     reject_high_error: bool,
     avoid_interference: bool,
     settings: CollisionSettings,
+    feature_extractor: core.StepFeatureExtractor | None = None,
+    geometry: PairGeometry | None = None,
 ) -> list[_CandidateOutcome]:
     error_outcome = _CandidateOutcome(label, constraints, flipped_constraints, omitted_constraints)
     try:
@@ -312,6 +333,7 @@ def _evaluate_candidate(
                 job.moving_part: str(assembly.part_paths[job.moving_part]),
             },
             constraints=constraints,
+            extractor=feature_extractor,
         )
         transform_candidates = _solve_candidates_with_mode(
             solver,
@@ -355,6 +377,7 @@ def _evaluate_candidate(
                         moving_step_path=assembly.part_paths[job.moving_part],
                         transform=expanded_transform,
                         settings=settings,
+                        geometry=geometry,
                     )
                     collision = collision_resolution.analysis
                     collision_adjusted = bool(collision_resolution.adjusted)
@@ -655,7 +678,7 @@ def _solve_candidates_with_mode(
     try:
         transform = solver.solve()
         if not reject_high_error or float(solver.diagnose_transform(transform)["max_error"]) <= float(max_error):
-            candidates.append((transform, "solvespace", None, "solvespace"))
+            return [(transform, "solvespace", None, "solvespace")]
         else:
             primary_error = (
                 "SolveSpace returned OK, but max_constraint_error exceeded "

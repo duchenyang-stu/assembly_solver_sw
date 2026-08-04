@@ -33,6 +33,17 @@ class CollisionSettings:
     rotation_sample_count: int = 24
 
 
+@dataclass
+class PairGeometry:
+    """OCC geometry shared by all candidates for one part pair."""
+
+    fixed_step_path: Path
+    moving_step_path: Path
+    fixed_shape: object
+    moving_source_shape: object
+    fixed_bbox: Optional[tuple[float, float, float, float, float, float]] = None
+
+
 @dataclass(frozen=True)
 class CollisionResolution:
     transform: list[list[float]]
@@ -42,6 +53,21 @@ class CollisionResolution:
     reason: str | None = None
 
 
+def load_pair_geometry(
+    fixed_step_path: str | Path,
+    moving_step_path: str | Path,
+) -> PairGeometry:
+    occ = _require_occ()
+    fixed_path = Path(fixed_step_path)
+    moving_path = Path(moving_step_path)
+    return PairGeometry(
+        fixed_step_path=fixed_path,
+        moving_step_path=moving_path,
+        fixed_shape=_load_step_shape(occ, fixed_path),
+        moving_source_shape=_load_step_shape(occ, moving_path),
+    )
+
+
 def resolve_collision(
     solver: core.PairAssemblySolver,
     *,
@@ -49,15 +75,20 @@ def resolve_collision(
     moving_step_path: str | Path,
     transform: Sequence[Sequence[float]],
     settings: CollisionSettings,
+    geometry: PairGeometry | None = None,
 ) -> CollisionResolution:
     matrix = _as_matrix4(transform)
     if not settings.enabled:
         return CollisionResolution(_matrix_to_list(matrix), True, False, {"enabled": False})
 
     occ = _require_occ()
-    fixed_shape = _load_step_shape(occ, Path(fixed_step_path))
-    moving_source_shape = _load_step_shape(occ, Path(moving_step_path))
+    if geometry is None:
+        geometry = load_pair_geometry(fixed_step_path, moving_step_path)
+    fixed_shape = geometry.fixed_shape
+    moving_source_shape = geometry.moving_source_shape
     moving_shape = _transform_shape(occ, moving_source_shape, matrix)
+    if geometry.fixed_bbox is None:
+        geometry.fixed_bbox = _shape_bbox(occ, fixed_shape)
 
     baseline_metrics = _measure_shape_interference(
         occ,
@@ -65,6 +96,7 @@ def resolve_collision(
         moving_shape,
         contact_tolerance=settings.contact_tolerance,
         common_volume_tolerance=settings.common_volume_tolerance,
+        fixed_bbox=geometry.fixed_bbox,
     )
     baseline_diagnosis = solver.diagnose_transform(matrix)
     rotation_hint = _infer_free_rotation_hint(solver)
@@ -115,6 +147,7 @@ def resolve_collision(
             axis_point=rotation_hint["axis_point"],
             axis_direction=rotation_hint["axis_direction"],
             settings=settings,
+            fixed_bbox=geometry.fixed_bbox,
         )
         analysis["rotation_relief"] = relief
 
@@ -304,10 +337,12 @@ def _measure_shape_interference(
     contact_tolerance: float,
     common_volume_tolerance: float,
     use_common_volume: bool = True,
+    fixed_bbox: Optional[tuple[float, float, float, float, float, float]] = None,
 ) -> dict[str, Any]:
     min_distance = _shape_min_distance(occ, fixed_shape, moving_shape)
     common_volume = _shape_common_volume(occ, fixed_shape, moving_shape) if use_common_volume else None
-    fixed_bbox = _shape_bbox(occ, fixed_shape)
+    if fixed_bbox is None:
+        fixed_bbox = _shape_bbox(occ, fixed_shape)
     moving_bbox = _shape_bbox(occ, moving_shape)
     bbox_overlap_volume = _bbox_overlap_volume(fixed_bbox, moving_bbox)
 
@@ -421,6 +456,7 @@ def _search_rotation_relief(
     axis_point: Sequence[float],
     axis_direction: Sequence[float],
     settings: CollisionSettings,
+    fixed_bbox: Optional[tuple[float, float, float, float, float, float]] = None,
 ) -> dict[str, Any]:
     sample_count = max(int(settings.rotation_sample_count), 2)
     best_angle = 0.0
@@ -448,6 +484,7 @@ def _search_rotation_relief(
             contact_tolerance=settings.contact_tolerance,
             common_volume_tolerance=settings.common_volume_tolerance,
             use_common_volume=False,
+            fixed_bbox=fixed_bbox,
         )
         if _interference_score(candidate_metrics) < _interference_score(best_metrics):
             best_angle = float(angle_deg)

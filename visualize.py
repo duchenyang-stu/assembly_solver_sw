@@ -341,10 +341,16 @@ def _solution_shapes(
     pair_dir = Path(output_dir) / _pair_stem(record) if use_pair_subdir else Path(output_dir)
     pair_dir.mkdir(parents=True, exist_ok=True)
 
-    fixed_shape = _load_step_shape(occ, assembly.part_paths[record.fixed_part])
+    geometry = getattr(record, "geometry", None)
+    fixed_shape = geometry.fixed_shape if geometry is not None else _load_step_shape(occ, assembly.part_paths[record.fixed_part])
+    moving_source_shape = (
+        geometry.moving_source_shape
+        if geometry is not None
+        else _load_step_shape(occ, assembly.part_paths[record.moving_part])
+    )
     moving_shape = _transform_shape(
         occ,
-        _load_step_shape(occ, assembly.part_paths[record.moving_part]),
+        moving_source_shape,
         transform,
     )
     return pair_dir, fixed_shape, moving_shape
