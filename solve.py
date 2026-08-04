@@ -164,30 +164,39 @@ def solve_jobs(
             if avoid_interference
             else None
         )
-        outcomes = [
-            outcome
-            for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(
-                job,
-                allow_coincident_orientation_flip=allow_coincident_orientation_flip,
-                allow_tangent_orientation_flip=allow_tangent_orientation_flip,
-                use_concentric_orientation=use_concentric_orientation,
-            )
-            for outcome in _evaluate_candidate(
-                assembly,
-                job,
-                label,
-                constraints,
-                flipped_constraints,
-                omitted_constraints,
-                solver_mode,
+        outcomes: list[_CandidateOutcome] = []
+        for _, candidates in _candidate_constraint_groups(
+            job,
+            allow_coincident_orientation_flip=allow_coincident_orientation_flip,
+            allow_tangent_orientation_flip=allow_tangent_orientation_flip,
+            use_concentric_orientation=use_concentric_orientation,
+        ):
+            group_outcomes = [
+                outcome
+                for label, constraints, flipped_constraints, omitted_constraints in candidates
+                for outcome in _evaluate_candidate(
+                    assembly,
+                    job,
+                    label,
+                    constraints,
+                    flipped_constraints,
+                    omitted_constraints,
+                    solver_mode,
+                    max_error=max_error,
+                    reject_high_error=reject_high_error,
+                    avoid_interference=avoid_interference,
+                    settings=settings,
+                    feature_extractor=feature_extractor,
+                    geometry=geometry,
+                )
+            ]
+            outcomes.extend(group_outcomes)
+            if _has_complete_acceptable_candidate(
+                group_outcomes,
                 max_error=max_error,
-                reject_high_error=reject_high_error,
                 avoid_interference=avoid_interference,
-                settings=settings,
-                feature_extractor=feature_extractor,
-                geometry=geometry,
-            )
-        ]
+            ):
+                break
         _annotate_weak_constraint_suspicion(outcomes)
         candidate_results = [_candidate_summary(outcome) for outcome in outcomes]
         acceptable = [
@@ -370,7 +379,13 @@ def _evaluate_candidate(
                 collision = None
                 collision_adjusted = None
                 final_transform = expanded_transform
-                if avoid_interference:
+                collision_was_evaluated = False
+                # Collision analysis is substantially more expensive than a
+                # residual check. A transform that already violates the
+                # assembly constraints cannot become an acceptable result.
+                initial_diagnosis = solver.diagnose_transform(expanded_transform)
+                initial_max_error = float(initial_diagnosis["max_error"])
+                if avoid_interference and initial_max_error <= float(max_error):
                     collision_resolution = resolve_collision(
                         solver,
                         fixed_step_path=assembly.part_paths[job.fixed_part],
@@ -382,8 +397,24 @@ def _evaluate_candidate(
                     collision = collision_resolution.analysis
                     collision_adjusted = bool(collision_resolution.adjusted)
                     final_transform = collision_resolution.transform
+                    collision_was_evaluated = True
+                elif avoid_interference:
+                    collision = {
+                        "classification": "not_checked_high_residual",
+                        "final_metrics": {
+                            "status": "not_checked_high_residual",
+                            "common_volume": None,
+                            "min_distance": None,
+                            "bbox_overlap_volume": None,
+                        },
+                    }
+                    collision_adjusted = False
 
-                diagnosis = solver.diagnose_transform(final_transform)
+                diagnosis = (
+                    solver.diagnose_transform(final_transform)
+                    if collision_was_evaluated
+                    else initial_diagnosis
+                )
                 outcome.solver = solver
                 outcome.transform = final_transform
                 outcome.solver_used = solver_used
@@ -399,23 +430,25 @@ def _evaluate_candidate(
     return [error_outcome]
 
 
-def _candidate_constraint_sets(
+def _candidate_constraint_groups(
     job: PairJob,
     *,
     allow_coincident_orientation_flip: bool = True,
     allow_tangent_orientation_flip: bool = True,
     use_concentric_orientation: bool = True,
-) -> list[tuple[str, list[core.PairConstraint], list[str], list[str]]]:
+) -> list[tuple[str, list[tuple[str, list[core.PairConstraint], list[str], list[str]]]]]:
+    """Build candidates from least to most permissive for early-exit evaluation."""
     constraints = _sort_constraints_for_solving(
         _constraints_for_orientation_policy(
             job.constraints,
             use_concentric_orientation=use_concentric_orientation,
         )
     )
-    candidates: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
+    groups: list[tuple[str, list[tuple[str, list[core.PairConstraint], list[str], list[str]]]]] = []
     seen: set[tuple[tuple[str, int], ...]] = set()
 
     def add_candidate(
+        group: list[tuple[str, list[core.PairConstraint], list[str], list[str]]],
         label: str,
         candidate_constraints: list[core.PairConstraint],
         flipped_constraints: list[str] | None = None,
@@ -428,9 +461,12 @@ def _candidate_constraint_sets(
         if key in seen:
             return
         seen.add(key)
-        candidates.append((label, ordered, list(flipped_constraints or []), list(omitted_constraints or [])))
+        group.append((label, ordered, list(flipped_constraints or []), list(omitted_constraints or [])))
 
-    add_candidate("primary", constraints)
+    primary: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
+    add_candidate(primary, "primary", constraints)
+    if primary:
+        groups.append(("primary", primary))
 
     flippable_coincident = [constraint.name for constraint in constraints if _is_oriented_plane_coincident(constraint)]
     flippable_tangent = [
@@ -438,14 +474,17 @@ def _candidate_constraint_sets(
         for constraint in constraints
         if constraint.kind == "tangent" and int(constraint.orientation) in {1, 2}
     ]
+    grouped_flips: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
     if allow_coincident_orientation_flip and flippable_coincident:
         add_candidate(
+            grouped_flips,
             "flipped_coincident_orientation",
             _flip_named_orientations(constraints, set(flippable_coincident)),
             flippable_coincident,
         )
     if allow_tangent_orientation_flip and flippable_tangent:
         add_candidate(
+            grouped_flips,
             "flipped_tangent_orientation",
             _flip_named_orientations(constraints, set(flippable_tangent)),
             flippable_tangent,
@@ -453,10 +492,13 @@ def _candidate_constraint_sets(
     if allow_coincident_orientation_flip and allow_tangent_orientation_flip and flippable_coincident and flippable_tangent:
         flipped_names = flippable_coincident + flippable_tangent
         add_candidate(
+            grouped_flips,
             "flipped_coincident_and_tangent_orientation",
             _flip_named_orientations(constraints, set(flipped_names)),
             flipped_names,
         )
+    if grouped_flips:
+        groups.append(("grouped_orientation_flips", grouped_flips))
 
     # Individual flips catch common mixed-orientation cases without exploding the
     # search space on dense prediction sets.
@@ -465,17 +507,44 @@ def _candidate_constraint_sets(
         individual_flips.extend(flippable_coincident)
     if allow_tangent_orientation_flip:
         individual_flips.extend(flippable_tangent)
+    individual_flip_candidates: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
     for constraint_name in individual_flips[:8]:
         add_candidate(
+            individual_flip_candidates,
             f"flipped_orientation:{constraint_name}",
             _flip_named_orientations(constraints, {constraint_name}),
             [constraint_name],
         )
+    if individual_flip_candidates:
+        groups.append(("individual_orientation_flips", individual_flip_candidates))
 
+    degraded_candidates: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
     for label, subset in _degraded_constraint_subsets(constraints):
         omitted = [constraint.name for constraint in constraints if constraint.name not in {item.name for item in subset}]
-        add_candidate(label, subset, [], omitted)
-    return candidates
+        add_candidate(degraded_candidates, label, subset, [], omitted)
+    if degraded_candidates:
+        groups.append(("degraded", degraded_candidates))
+    return groups
+
+
+def _candidate_constraint_sets(
+    job: PairJob,
+    *,
+    allow_coincident_orientation_flip: bool = True,
+    allow_tangent_orientation_flip: bool = True,
+    use_concentric_orientation: bool = True,
+) -> list[tuple[str, list[core.PairConstraint], list[str], list[str]]]:
+    """Compatibility helper returning all candidates in their evaluation order."""
+    return [
+        candidate
+        for _, group in _candidate_constraint_groups(
+            job,
+            allow_coincident_orientation_flip=allow_coincident_orientation_flip,
+            allow_tangent_orientation_flip=allow_tangent_orientation_flip,
+            use_concentric_orientation=use_concentric_orientation,
+        )
+        for candidate in group
+    ]
 
 
 def _constraints_for_orientation_policy(
@@ -586,6 +655,24 @@ def _candidate_is_acceptable(
         return True
     metrics = _candidate_final_metrics(outcome)
     return metrics.get("status") in {"clearance", "contact"}
+
+
+def _has_complete_acceptable_candidate(
+    outcomes: list[_CandidateOutcome],
+    *,
+    max_error: float,
+    avoid_interference: bool,
+) -> bool:
+    """A complete valid result makes later, more permissive groups unnecessary."""
+    return any(
+        not outcome.omitted_constraints
+        and _candidate_is_acceptable(
+            outcome,
+            max_error=max_error,
+            avoid_interference=avoid_interference,
+        )
+        for outcome in outcomes
+    )
 
 
 def _candidate_score(outcome: _CandidateOutcome) -> tuple[float, float, float, float, float, int, int]:
