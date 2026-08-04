@@ -53,9 +53,14 @@ def parse_args() -> argparse.Namespace:
         "--gt-original-semantics",
         action="store_true",
         help=(
-            "Keep Coincident alignment, disable orientation-flip candidates, and treat Concentric as an "
-            "unoriented axis."
+            "Keep Coincident and Tangent GT orientations by disabling orientation-flip candidates. "
+            "Does not change Concentric orientation handling."
         ),
+    )
+    parser.add_argument(
+        "--unoriented-concentric",
+        action="store_true",
+        help="Treat Concentric constraints as unoriented axes by ignoring their alignment/orientation sign.",
     )
     parser.add_argument(
         "--contact-tolerance",
@@ -103,7 +108,7 @@ def main() -> None:
         rotation_sample_count=args.rotation_samples,
         allow_coincident_orientation_flip=not args.gt_original_semantics,
         allow_tangent_orientation_flip=not args.gt_original_semantics,
-        use_concentric_orientation=not args.gt_original_semantics,
+        use_concentric_orientation=not args.unoriented_concentric,
     )
 
     result_payload = {
@@ -119,7 +124,7 @@ def main() -> None:
         "gt_original_semantics": bool(args.gt_original_semantics),
         "allow_coincident_orientation_flip": not args.gt_original_semantics,
         "allow_tangent_orientation_flip": not args.gt_original_semantics,
-        "use_concentric_orientation": not args.gt_original_semantics,
+        "use_concentric_orientation": not args.unoriented_concentric,
         "contact_tolerance": args.contact_tolerance,
         "common_volume_tolerance": args.common_volume_tolerance,
         "rotation_samples": args.rotation_samples,

@@ -58,8 +58,8 @@ def parse_args() -> argparse.Namespace:
         "--gt-original-semantics",
         action="store_true",
         help=(
-            "Evaluate with original GT semantics: keep Coincident alignment, disable Coincident/Tangent "
-            "orientation flip candidates, and treat Concentric as an unoriented axis."
+            "Evaluate Coincident and Tangent constraints with their original GT orientations by disabling "
+            "orientation-flip candidates. Does not change Concentric orientation handling."
         ),
     )
     parser.add_argument(
@@ -128,7 +128,7 @@ def main() -> None:
         "search_free_rotation": not args.no_free_rotation_search,
         "allow_coincident_orientation_flip": not (args.gt_original_semantics or args.no_coincident_orientation_flip),
         "allow_tangent_orientation_flip": not (args.gt_original_semantics or args.no_tangent_orientation_flip),
-        "use_concentric_orientation": not (args.gt_original_semantics or args.unoriented_concentric),
+        "use_concentric_orientation": not args.unoriented_concentric,
         "gt_original_semantics": bool(args.gt_original_semantics),
         "rotation_samples": int(args.rotation_samples),
         "flat_pair_output": bool(args.flat_pair_output),
