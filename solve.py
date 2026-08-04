@@ -127,6 +127,9 @@ def solve_jobs(
     residual_bad_tolerance: float = 1e-2,
     search_free_rotation: bool = True,
     rotation_sample_count: int = 24,
+    allow_coincident_orientation_flip: bool = True,
+    allow_tangent_orientation_flip: bool = True,
+    use_concentric_orientation: bool = True,
 ) -> list[SolveRecord]:
     if solver_mode not in {"solvespace", "analytic", "solvespace-then-analytic"}:
         raise ValueError("solver_mode must be one of: solvespace, analytic, solvespace-then-analytic")
@@ -149,7 +152,12 @@ def solve_jobs(
         )
         outcomes = [
             outcome
-            for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(job)
+            for label, constraints, flipped_constraints, omitted_constraints in _candidate_constraint_sets(
+                job,
+                allow_coincident_orientation_flip=allow_coincident_orientation_flip,
+                allow_tangent_orientation_flip=allow_tangent_orientation_flip,
+                use_concentric_orientation=use_concentric_orientation,
+            )
             for outcome in _evaluate_candidate(
                 assembly,
                 job,
@@ -370,8 +378,17 @@ def _evaluate_candidate(
 
 def _candidate_constraint_sets(
     job: PairJob,
+    *,
+    allow_coincident_orientation_flip: bool = True,
+    allow_tangent_orientation_flip: bool = True,
+    use_concentric_orientation: bool = True,
 ) -> list[tuple[str, list[core.PairConstraint], list[str], list[str]]]:
-    constraints = _sort_constraints_for_solving(job.constraints)
+    constraints = _sort_constraints_for_solving(
+        _constraints_for_orientation_policy(
+            job.constraints,
+            use_concentric_orientation=use_concentric_orientation,
+        )
+    )
     candidates: list[tuple[str, list[core.PairConstraint], list[str], list[str]]] = []
     seen: set[tuple[tuple[str, int], ...]] = set()
 
@@ -398,19 +415,19 @@ def _candidate_constraint_sets(
         for constraint in constraints
         if constraint.kind == "tangent" and int(constraint.orientation) in {1, 2}
     ]
-    if flippable_coincident:
+    if allow_coincident_orientation_flip and flippable_coincident:
         add_candidate(
             "flipped_coincident_orientation",
             _flip_named_orientations(constraints, set(flippable_coincident)),
             flippable_coincident,
         )
-    if flippable_tangent:
+    if allow_tangent_orientation_flip and flippable_tangent:
         add_candidate(
             "flipped_tangent_orientation",
             _flip_named_orientations(constraints, set(flippable_tangent)),
             flippable_tangent,
         )
-    if flippable_coincident and flippable_tangent:
+    if allow_coincident_orientation_flip and allow_tangent_orientation_flip and flippable_coincident and flippable_tangent:
         flipped_names = flippable_coincident + flippable_tangent
         add_candidate(
             "flipped_coincident_and_tangent_orientation",
@@ -420,7 +437,12 @@ def _candidate_constraint_sets(
 
     # Individual flips catch common mixed-orientation cases without exploding the
     # search space on dense prediction sets.
-    for constraint_name in (flippable_coincident + flippable_tangent)[:8]:
+    individual_flips = []
+    if allow_coincident_orientation_flip:
+        individual_flips.extend(flippable_coincident)
+    if allow_tangent_orientation_flip:
+        individual_flips.extend(flippable_tangent)
+    for constraint_name in individual_flips[:8]:
         add_candidate(
             f"flipped_orientation:{constraint_name}",
             _flip_named_orientations(constraints, {constraint_name}),
@@ -431,6 +453,21 @@ def _candidate_constraint_sets(
         omitted = [constraint.name for constraint in constraints if constraint.name not in {item.name for item in subset}]
         add_candidate(label, subset, [], omitted)
     return candidates
+
+
+def _constraints_for_orientation_policy(
+    constraints: list[core.PairConstraint] | tuple[core.PairConstraint, ...],
+    *,
+    use_concentric_orientation: bool,
+) -> list[core.PairConstraint]:
+    if use_concentric_orientation:
+        return list(constraints)
+    return [
+        replace(constraint, orientation=0)
+        if constraint.kind == "concentric" and int(constraint.orientation) in {1, 2}
+        else constraint
+        for constraint in constraints
+    ]
 
 
 def _is_oriented_plane_coincident(constraint: core.PairConstraint) -> bool:

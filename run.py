@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
         help="When a transform interferes, do not search the unconstrained coaxial rotation for a non-interfering pose.",
     )
     parser.add_argument(
+        "--gt-original-semantics",
+        action="store_true",
+        help=(
+            "Keep Coincident alignment, disable orientation-flip candidates, and treat Concentric as an "
+            "unoriented axis."
+        ),
+    )
+    parser.add_argument(
         "--contact-tolerance",
         type=float,
         default=1e-3,
@@ -93,6 +101,9 @@ def main() -> None:
         common_volume_tolerance=args.common_volume_tolerance,
         search_free_rotation=not args.no_free_rotation_search,
         rotation_sample_count=args.rotation_samples,
+        allow_coincident_orientation_flip=not args.gt_original_semantics,
+        allow_tangent_orientation_flip=not args.gt_original_semantics,
+        use_concentric_orientation=not args.gt_original_semantics,
     )
 
     result_payload = {
@@ -105,6 +116,10 @@ def main() -> None:
         "avoid_interference": not args.allow_interference,
         "allow_interference": bool(args.allow_interference),
         "search_free_rotation": not args.no_free_rotation_search,
+        "gt_original_semantics": bool(args.gt_original_semantics),
+        "allow_coincident_orientation_flip": not args.gt_original_semantics,
+        "allow_tangent_orientation_flip": not args.gt_original_semantics,
+        "use_concentric_orientation": not args.gt_original_semantics,
         "contact_tolerance": args.contact_tolerance,
         "common_volume_tolerance": args.common_volume_tolerance,
         "rotation_samples": args.rotation_samples,

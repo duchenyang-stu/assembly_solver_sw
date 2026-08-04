@@ -54,6 +54,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reject-high-error", action="store_true")
     parser.add_argument("--allow-interference", action="store_true")
     parser.add_argument("--no-free-rotation-search", action="store_true")
+    parser.add_argument(
+        "--gt-original-semantics",
+        action="store_true",
+        help=(
+            "Evaluate with original GT semantics: keep Coincident alignment, disable Coincident/Tangent "
+            "orientation flip candidates, and treat Concentric as an unoriented axis."
+        ),
+    )
+    parser.add_argument(
+        "--no-coincident-orientation-flip",
+        action="store_true",
+        help="Disable candidates that flip Coincident orientation.",
+    )
+    parser.add_argument(
+        "--no-tangent-orientation-flip",
+        action="store_true",
+        help="Disable candidates that flip Tangent orientation.",
+    )
+    parser.add_argument(
+        "--unoriented-concentric",
+        action="store_true",
+        help="Treat Concentric constraints as unoriented axes by ignoring their alignment/orientation sign.",
+    )
     parser.add_argument("--contact-tolerance", type=float, default=1e-3)
     parser.add_argument("--common-volume-tolerance", type=float, default=1e-3)
     parser.add_argument("--rotation-samples", type=int, default=24)
@@ -103,6 +126,10 @@ def main() -> None:
         "contact_tolerance": float(args.contact_tolerance),
         "common_volume_tolerance": float(args.common_volume_tolerance),
         "search_free_rotation": not args.no_free_rotation_search,
+        "allow_coincident_orientation_flip": not (args.gt_original_semantics or args.no_coincident_orientation_flip),
+        "allow_tangent_orientation_flip": not (args.gt_original_semantics or args.no_tangent_orientation_flip),
+        "use_concentric_orientation": not (args.gt_original_semantics or args.unoriented_concentric),
+        "gt_original_semantics": bool(args.gt_original_semantics),
         "rotation_samples": int(args.rotation_samples),
         "flat_pair_output": bool(args.flat_pair_output),
         "dry_run": bool(args.dry_run),
@@ -159,6 +186,10 @@ def main() -> None:
         "flat_pair_output": bool(args.flat_pair_output),
         "workers": workers,
         "artifact_formats": ["step"],
+        "gt_original_semantics": bool(args.gt_original_semantics),
+        "allow_coincident_orientation_flip": context["allow_coincident_orientation_flip"],
+        "allow_tangent_orientation_flip": context["allow_tangent_orientation_flip"],
+        "use_concentric_orientation": context["use_concentric_orientation"],
         "sample_count": len(batch_results),
         "ok_count": ok_count,
         "ok_samples_json": str(ok_samples_path),
@@ -246,6 +277,9 @@ def _run_sample_task(task: dict[str, Any]) -> dict[str, Any]:
             contact_tolerance=float(context["contact_tolerance"]),
             common_volume_tolerance=float(context["common_volume_tolerance"]),
             search_free_rotation=bool(context["search_free_rotation"]),
+            allow_coincident_orientation_flip=bool(context["allow_coincident_orientation_flip"]),
+            allow_tangent_orientation_flip=bool(context["allow_tangent_orientation_flip"]),
+            use_concentric_orientation=bool(context["use_concentric_orientation"]),
             rotation_samples=int(context["rotation_samples"]),
             flat_pair_output=bool(context["flat_pair_output"]),
             dry_run=bool(context["dry_run"]),
@@ -293,6 +327,9 @@ def _process_sample(
     contact_tolerance: float,
     common_volume_tolerance: float,
     search_free_rotation: bool,
+    allow_coincident_orientation_flip: bool,
+    allow_tangent_orientation_flip: bool,
+    use_concentric_orientation: bool,
     rotation_samples: int,
     flat_pair_output: bool,
     dry_run: bool,
@@ -341,6 +378,9 @@ def _process_sample(
         contact_tolerance=contact_tolerance,
         common_volume_tolerance=common_volume_tolerance,
         search_free_rotation=search_free_rotation,
+        allow_coincident_orientation_flip=allow_coincident_orientation_flip,
+        allow_tangent_orientation_flip=allow_tangent_orientation_flip,
+        use_concentric_orientation=use_concentric_orientation,
         rotation_sample_count=rotation_samples,
     )
 
