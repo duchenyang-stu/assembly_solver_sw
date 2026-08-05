@@ -355,17 +355,10 @@ def _evaluate_candidate(
 
         outcomes: list[_CandidateOutcome] = []
         for transform, solver_used, primary_error, base_variant_label in transform_candidates:
-            try:
-                expanded_transforms = _expand_concentric_free_motion_candidates(
-                    solver,
-                    transform,
-                    max_error=max_error,
-                    sample_count=settings.rotation_sample_count,
-                )
-            except Exception:
-                expanded_transforms = [(transform, None)]
-
-            for expanded_transform, motion_label in expanded_transforms:
+            def evaluate_transform(
+                candidate_transform: list[list[float]] | np.ndarray,
+                motion_label: str | None,
+            ) -> _CandidateOutcome:
                 variant_label = base_variant_label
                 if motion_label:
                     variant_label = f"{variant_label}:{motion_label}" if variant_label else motion_label
@@ -378,19 +371,19 @@ def _evaluate_candidate(
                 )
                 collision = None
                 collision_adjusted = None
-                final_transform = expanded_transform
+                final_transform = candidate_transform
                 collision_was_evaluated = False
                 # Collision analysis is substantially more expensive than a
                 # residual check. A transform that already violates the
                 # assembly constraints cannot become an acceptable result.
-                initial_diagnosis = solver.diagnose_transform(expanded_transform)
+                initial_diagnosis = solver.diagnose_transform(candidate_transform)
                 initial_max_error = float(initial_diagnosis["max_error"])
                 if avoid_interference and initial_max_error <= float(max_error):
                     collision_resolution = resolve_collision(
                         solver,
                         fixed_step_path=assembly.part_paths[job.fixed_part],
                         moving_step_path=assembly.part_paths[job.moving_part],
-                        transform=expanded_transform,
+                        transform=candidate_transform,
                         settings=settings,
                         geometry=geometry,
                     )
@@ -422,7 +415,36 @@ def _evaluate_candidate(
                 outcome.max_constraint_error = float(diagnosis["max_error"])
                 outcome.collision = collision
                 outcome.collision_adjusted = collision_adjusted
-                outcomes.append(outcome)
+                return outcome
+
+            # Always validate the solver's unmodified pose first.  A valid,
+            # collision-free pose is already a complete answer, so do not
+            # spend time enumerating the unconstrained concentric motion.
+            base_outcome = evaluate_transform(transform, None)
+            outcomes.append(base_outcome)
+            if _candidate_is_acceptable(
+                base_outcome,
+                max_error=max_error,
+                avoid_interference=avoid_interference,
+            ):
+                continue
+
+            try:
+                expanded_transforms = _expand_concentric_free_motion_candidates(
+                    solver,
+                    transform,
+                    max_error=max_error,
+                    sample_count=settings.rotation_sample_count,
+                )
+            except Exception:
+                expanded_transforms = []
+
+            for expanded_transform, motion_label in expanded_transforms:
+                # The base transform was evaluated above; expansion includes
+                # it as angle=0/shift=0, so avoid resolving it twice.
+                if motion_label is None:
+                    continue
+                outcomes.append(evaluate_transform(expanded_transform, motion_label))
         return outcomes
     except Exception as exc:
         error_outcome.error = f"{type(exc).__name__}: {exc}"
